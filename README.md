@@ -31,14 +31,23 @@ To use Brick Layers in PrusaSlicer or OrcaSlicer, configure it as a post-process
 1. **Access the post-processing section:**
     - **PrusaSlicer**: Go to **Print Settings > Output options**.
     - **OrcaSlicer**: Go to **Process > Others > Post-proccessing Script**.
+      
 2. **Add the following command in the Post-processing scripts section:**
 
     ```
     "python_path" "script_path" -layerHeight [value] -extrusionMultiplier [value]
     ```
-    - Replace `"python_path"` with the path to your Python executable. You can get the path from righ clicking your Python executable and clicking "Copy as Path"
-    - Replace `"script_path"` with the path to the `bricklayers.py` script. You can get the path from righ clicking `bricklayers.py` and clicking "Copy as Path"
-    - Replace `[value]` for `-layerHeight` and `-extrusionMultiplier` with your desired values. Note: -layerHeight value must be the layer height you sliced your file with.
+    - Replace `"python_path"` with the path to your Python executable.
+      You can get the path from right clicking your Python executable and clicking "Copy as Path"
+    - Replace `"script_path"` with the path to the `bricklayers.py` script.
+      You can get the path from right clicking `bricklayers.py` and clicking "Copy as Path"
+    - Replace `[value]` for `-layerHeight` and `-extrusionMultiplier` with your desired values.
+      Note: -layerHeight value must be the layer height you sliced your file with.
+      
+You can also find your Python Path by...
+    - opening the Command Prompt (cmd).
+    - Run the command `where python`.
+    - This will output the path to your Python executable. For example: `C:\Users\USERNAME\AppData\Local\Programs\Python\Python313\python.exe`
 
 After slicing and saving your G-code file, the script will run automatically.
 
