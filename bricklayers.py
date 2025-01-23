@@ -1,143 +1,171 @@
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program. If not, see <https://www.gnu.org/licenses/>.
-#
-# Copyright (c) [2025] [Roman Tenger]
 import re
 import sys
 import logging
 import os
 import argparse
+from tempfile import NamedTemporaryFile
+import io
 
-# Get the directory where the script is located
-script_dir = os.path.dirname(os.path.abspath(__file__))
+class GCodeProcessor:
+    def __init__(self, layer_height, extrusion_multiplier):
+        self.layer_height = layer_height
+        self.extrusion_multiplier = extrusion_multiplier
+        self.current_layer = 0
+        self.current_z = 0.0
+        self.perimeter_type = None
+        self.perimeter_block_count = 0
+        self.inside_perimeter_block = False
+        self.z_shift = layer_height * 0.5
+        self.total_layers = 0
+        self.buffer_size = 1024 * 1024  # 1MB buffer size
+        
+    def count_layers(self, input_file):
+        """Count layers using buffered reading"""
+        count = 0
+        with open(input_file, 'r') as f:
+            buffer = io.StringIO()
+            while True:
+                chunk = f.read(self.buffer_size)
+                if not chunk:
+                    break
+                buffer.write(chunk)
+                buffer.seek(0)
+                
+                for line in buffer:
+                    if line.startswith("G1 Z"):
+                        count += 1
+                        
+                buffer.seek(0)
+                buffer.truncate(0)
+        return count
 
-# Configure logging to save in the script's directory
-log_file_path = os.path.join(script_dir, "z_shift_log.txt")
-logging.basicConfig(
-    filename=log_file_path,
-    filemode="w",
-    level=logging.INFO,
-    format="%(asctime)s - %(message)s"
-)
-
-def process_gcode(input_file, layer_height, extrusion_multiplier):
-    current_layer = 0
-    current_z = 0.0
-    perimeter_type = None
-    perimeter_block_count = 0
-    inside_perimeter_block = False
-    z_shift = layer_height * 0.5
-    logging.info("Starting G-code processing")
-    logging.info(f"Input file: {input_file}")
-    logging.info(f"Z-shift: {z_shift} mm, Layer height: {layer_height} mm")
-
-    # Read the input G-code
-    with open(input_file, 'r') as infile:
-        lines = infile.readlines()
-
-    # Identify the total number of layers by looking for `G1 Z` commands
-    total_layers = sum(1 for line in lines if line.startswith("G1 Z"))
-
-    # Process the G-code
-    modified_lines = []
-    for line in lines:
+    def process_line(self, line, is_last_layer):
+        """Process a single line of G-code"""
+        modified_lines = []
+        
         # Detect layer changes
         if line.startswith("G1 Z"):
             z_match = re.search(r'Z([-\d.]+)', line)
             if z_match:
-                current_z = float(z_match.group(1))
-                current_layer = int(current_z / layer_height)
-
-                perimeter_block_count = 0  # Reset block counter for new layer
-                logging.info(f"Layer {current_layer} detected at Z={current_z:.3f}")
+                self.current_z = float(z_match.group(1))
+                self.current_layer = int(self.current_z / self.layer_height)
+                self.perimeter_block_count = 0
+                logging.info(f"Layer {self.current_layer} detected at Z={self.current_z:.3f}")
             modified_lines.append(line)
-            continue
+            return modified_lines
 
-        # Detect perimeter types from PrusaSlicer comments
+        # Detect perimeter types
         if ";TYPE:External perimeter" in line or ";TYPE:Outer wall" in line:
-            perimeter_type = "external"
-            inside_perimeter_block = False
-            logging.info(f"External perimeter detected at layer {current_layer}")
+            self.perimeter_type = "external"
+            self.inside_perimeter_block = False
         elif ";TYPE:Perimeter" in line or ";TYPE:Inner wall" in line:
-            perimeter_type = "internal"
-            inside_perimeter_block = False
-            logging.info(f"Internal perimeter block started at layer {current_layer}")
-        elif ";TYPE:" in line:  # Reset for other types
-            perimeter_type = None
-            inside_perimeter_block = False
+            self.perimeter_type = "internal"
+            self.inside_perimeter_block = False
+        elif ";TYPE:" in line:
+            self.perimeter_type = None
+            self.inside_perimeter_block = False
 
-        # Group lines into perimeter blocks
-        if perimeter_type == "internal" and line.startswith("G1") and "X" in line and "Y" in line and "E" in line:
-            # Start a new perimeter block if not already inside one
-            if not inside_perimeter_block:
-                perimeter_block_count += 1
-                inside_perimeter_block = True
-                logging.info(f"Perimeter block #{perimeter_block_count} detected at layer {current_layer}")
-
-                # Insert the corresponding Z height for this block
-                is_shifted = False  # Flag for whether this block is Z-shifted
-                if perimeter_block_count % 2 == 1:  # Apply Z-shift to odd-numbered blocks
-                    adjusted_z = current_z + z_shift
-                    logging.info(f"Inserting G1 Z{adjusted_z:.3f} for shifted perimeter block #{perimeter_block_count}")
-                    modified_lines.append(f"G1 Z{adjusted_z:.3f} ; Shifted Z for block #{perimeter_block_count}\n")
+        # Process perimeter blocks
+        if self.perimeter_type == "internal" and line.startswith("G1") and "X" in line and "Y" in line and "E" in line:
+            if not self.inside_perimeter_block:
+                self.perimeter_block_count += 1
+                self.inside_perimeter_block = True
+                
+                is_shifted = False
+                if self.perimeter_block_count % 2 == 1:
+                    adjusted_z = self.current_z + self.z_shift
+                    modified_lines.append(f"G1 Z{adjusted_z:.3f} ; Shifted Z for block #{self.perimeter_block_count}\n")
                     is_shifted = True
-                else:  # Reset to the true layer height for even-numbered blocks
-                    logging.info(f"Inserting G1 Z{current_z:.3f} for non-shifted perimeter block #{perimeter_block_count}")
-                    modified_lines.append(f"G1 Z{current_z:.3f} ; Reset Z for block #{perimeter_block_count}\n")
+                else:
+                    modified_lines.append(f"G1 Z{self.current_z:.3f} ; Reset Z for block #{self.perimeter_block_count}\n")
 
-            # Adjust extrusion (`E` values) for shifted blocks on the first and last layer
-            if is_shifted:
-                e_match = re.search(r'E([-\d.]+)', line)
-                if e_match:
-                    e_value = float(e_match.group(1))
-                    if current_layer == 0:  # First layer
-                        new_e_value = e_value * 1.5
-                        logging.info(f"Multiplying E value by 1.5 on first layer (shifted block): {e_value:.5f} -> {new_e_value:.5f}")
+                if is_shifted:
+                    e_match = re.search(r'E([-\d.]+)', line)
+                    if e_match:
+                        e_value = float(e_match.group(1))
+                        if self.current_layer == 0:
+                            new_e_value = e_value * 1.5
+                        elif is_last_layer:
+                            new_e_value = e_value * 0.5
+                        else:
+                            new_e_value = e_value * self.extrusion_multiplier
+                        
                         line = re.sub(r'E[-\d.]+', f'E{new_e_value:.5f}', line).strip()
-                        line += f" ; Adjusted E for first layer, block #{perimeter_block_count}\n"
-                    elif current_layer == total_layers - 1:  # Last layer
-                        new_e_value = e_value * 0.5
-                        logging.info(f"Multiplying E value by 0.5 on last layer (shifted block): {e_value:.5f} -> {new_e_value:.5f}")
-                        line = re.sub(r'E[-\d.]+', f'E{new_e_value:.5f}', line).strip()
-                        line += f" ; Adjusted E for last layer, block #{perimeter_block_count}\n"
-                    else: 
-                        new_e_value = e_value * extrusion_multiplier
-                        logging.info(f"Multiplying E value by extrusionMultiplier")
-                        line = re.sub(r'E[-\d.]+', f'E{new_e_value:.5f}', line).strip()
-                        line += f" ; Adjusted E for extrusionMultiplier, block #{perimeter_block_count}\n"
-						
-        elif perimeter_type == "internal" and line.startswith("G1") and "X" in line and "Y" in line and "F" in line:  # End of perimeter block
-            inside_perimeter_block = False
+                        line += f" ; Adjusted E for layer {self.current_layer}, block #{self.perimeter_block_count}\n"
+
+        elif self.perimeter_type == "internal" and line.startswith("G1") and "X" in line and "Y" in line and "F" in line:
+            self.inside_perimeter_block = False
 
         modified_lines.append(line)
+        return modified_lines
 
-    # Overwrite the input file with the modified G-code
-    with open(input_file, 'w') as outfile:
-        outfile.writelines(modified_lines)
+    def process_gcode(self, input_file):
+        """Process G-code file using buffered reading and writing"""
+        # Set up logging
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        log_file_path = os.path.join(script_dir, "z_shift_log.txt")
+        logging.basicConfig(
+            filename=log_file_path,
+            filemode="w",
+            level=logging.INFO,
+            format="%(asctime)s - %(message)s"
+        )
+        
+        logging.info("Starting G-code processing")
+        logging.info(f"Input file: {input_file}")
+        logging.info(f"Z-shift: {self.z_shift} mm, Layer height: {self.layer_height} mm")
 
-    logging.info("G-code processing completed")
-    logging.info(f"Log file saved at {log_file_path}")
+        # Count total layers first
+        self.total_layers = self.count_layers(input_file)
+        logging.info(f"Total layers detected: {self.total_layers}")
 
-# Main execution
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Post-process G-code for Z-shifting and extrusion adjustments.")
+        # Process the file using a temporary file
+        temp_file = NamedTemporaryFile(mode='w', delete=False)
+        try:
+            with open(input_file, 'r') as infile:
+                buffer = io.StringIO()
+                while True:
+                    chunk = infile.read(self.buffer_size)
+                    if not chunk:
+                        break
+                    
+                    buffer.write(chunk)
+                    buffer.seek(0)
+                    
+                    for line in buffer:
+                        is_last_layer = self.current_layer == self.total_layers - 1
+                        modified_lines = self.process_line(line, is_last_layer)
+                        temp_file.writelines(modified_lines)
+                    
+                    buffer.seek(0)
+                    buffer.truncate(0)
+                    
+            temp_file.close()
+            
+            # Replace original file with processed file
+            os.replace(temp_file.name, input_file)
+            
+        except Exception as e:
+            logging.error(f"Error processing file: {str(e)}")
+            if os.path.exists(temp_file.name):
+                os.unlink(temp_file.name)
+            raise
+        
+        logging.info("G-code processing completed")
+        logging.info(f"Log file saved at {log_file_path}")
+
+def main():
+    parser = argparse.ArgumentParser(description="Memory-efficient G-code post-processor for Z-shifting and extrusion adjustments.")
     parser.add_argument("input_file", help="Path to the input G-code file")
     parser.add_argument("-layerHeight", type=float, default=0.2, help="Layer height in mm (default: 0.2mm)")
-    parser.add_argument("-extrusionMultiplier", type=float, default=1, help="Extrusion multiplier for first layer (default: 1.5x)")
+    parser.add_argument("-extrusionMultiplier", type=float, default=1, help="Extrusion multiplier (default: 1.0)")
     args = parser.parse_args()
 
-    process_gcode(
-        input_file=args.input_file,
+    processor = GCodeProcessor(
         layer_height=args.layerHeight,
-        extrusion_multiplier=args.extrusionMultiplier,
+        extrusion_multiplier=args.extrusionMultiplier
     )
+    processor.process_gcode(args.input_file)
+
+if __name__ == "__main__":
+    main()
