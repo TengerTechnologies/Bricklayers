@@ -45,9 +45,9 @@ To use Brick Layers in PrusaSlicer or OrcaSlicer, configure it as a post-process
       Note: -layerHeight value must be the layer height you sliced your file with.
       
 You can also find your Python Path by...
-    - opening the Command Prompt (cmd).
-    - Run the command `where python`.
-    - This will output the path to your Python executable. For example: `C:\Users\USERNAME\AppData\Local\Programs\Python\Python313\python.exe`
+- opening the Command Prompt (cmd).
+- Run the command `where python`.
+- This will output the path to your Python executable. For example: `C:\Users\USERNAME\AppData\Local\Programs\Python\Python313\python.exe`
 
 After slicing and saving your G-code file, the script will run automatically.
 
