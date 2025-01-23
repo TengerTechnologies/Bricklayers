@@ -97,7 +97,7 @@ If you enjoy this project, consider supporting it by:
 
 For additional context, check out:
 - [Stefan's CNC Kitchen video](https://www.youtube.com/watch?v=5hGm6cubFVs&t=600s))
-- [Geek Dour’s video on patents](https://www.youtube.com/your-video-link)](https://www.python.org/downloads/)
+- [Geek Dour’s video on patents](https://www.youtube.com/watch?v=9IdNA_hWiyE&t=28s)
 
 ## Copyright and License
 Copyright (c) 2025 Roman Tenger.
