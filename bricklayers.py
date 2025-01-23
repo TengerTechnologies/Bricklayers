@@ -17,6 +17,9 @@ import sys
 import logging
 import os
 import argparse
+from pathlib import Path
+import shutil
+import subprocess
 
 # Get the directory where the script is located
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -134,10 +137,46 @@ if __name__ == "__main__":
     parser.add_argument("input_file", help="Path to the input G-code file")
     parser.add_argument("-layerHeight", type=float, default=0.2, help="Layer height in mm (default: 0.2mm)")
     parser.add_argument("-extrusionMultiplier", type=float, default=1, help="Extrusion multiplier for first layer (default: 1.5x)")
+    parser.add_argument("-bgcode", action='store_true', help="Input file is binary gcode (PrusaSlicer default from v2.7)")
     args = parser.parse_args()
 
+    bgcode = False
+    rename = False
+
+    input_path = Path(args.input_file)
+    if args.bgcode or input_path.suffix == '.bgcode':
+        bgcode_exe = shutil.which('bgcode')
+        if bgcode_exe:
+            # adjust file name to have proper suffix if necessary
+            if input_path.suffix != '.bgcode':
+                rename = True
+                input_path = input_path.rename(args.input_file + '.bgcode')
+
+            try:
+                subprocess.check_call([bgcode_exe, str(input_path)])
+                bgcode = True
+                # change name to reflect bgcode command's renaming of the file
+                input_path = input_path.parent / (input_path.stem + '.gcode')
+            except CalledProcessError:
+                None
+
     process_gcode(
-        input_file=args.input_file,
+        input_file=input_path,
         layer_height=args.layerHeight,
         extrusion_multiplier=args.extrusionMultiplier,
     )
+
+    # restore encoding if decoded
+    if bgcode:
+        try:
+            subprocess.check_call([bgcode_exe, str(input_path)])
+            # bgcode command doesn't delete the source file
+            input_path.unlink()
+            # rename should operate on the bgcode file
+            input_path = input_path.parent / (input_path.stem + '.bgcode')
+        except CalledProcessError:
+            None
+
+    # remove suffix if added
+    if rename:
+        input_path.rename(args.input_file)
