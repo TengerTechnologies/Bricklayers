@@ -17,6 +17,16 @@ import logging
 import os
 import argparse
 
+def get_layer_height_from_gcode(lines):
+    """Extract layer height from G-code comments"""
+    for i, line in enumerate(lines[:1000]):  # Check first 1000 lines
+        if "; layer_height = " in line:
+            try:
+                return float(line.split("= ")[1].strip())
+            except (ValueError, IndexError):
+                logging.warning("Failed to parse layer height from comment")
+    return None
+
 def detect_printer_type(gcode_lines):
     """Detect printer type based on G-code features"""
     logging.info("Starting printer type detection")
@@ -50,6 +60,18 @@ def process_gcode(input_file, layer_height, extrusion_multiplier):
         format="%(asctime)s - %(message)s"
     )
 
+    with open(input_file, 'r') as infile:
+        lines = infile.readlines()
+
+    # If layer height not provided, try to parse from G-code
+    if layer_height is None:
+        layer_height = get_layer_height_from_gcode(lines)
+        if layer_height is None:
+            layer_height = 0.2  # Default value
+            logging.info(f"Layer height not found in G-code. Using default: {layer_height}mm")
+        else:
+            logging.info(f"Layer height parsed from G-code: {layer_height}mm")
+
     current_layer = 0
     current_z = 0.0
     perimeter_type = None
@@ -60,9 +82,6 @@ def process_gcode(input_file, layer_height, extrusion_multiplier):
     
     logging.info("Starting G-code processing")
     logging.info(f"Settings: Layer height={layer_height}mm, Z-shift={z_shift}mm, Extrusion multiplier={extrusion_multiplier}")
-
-    with open(input_file, 'r') as infile:
-        lines = infile.readlines()
 
     printer_type = detect_printer_type(lines)
     logging.info(f"Detected printer type: {printer_type}")
@@ -148,8 +167,8 @@ def process_gcode(input_file, layer_height, extrusion_multiplier):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Post-process G-code for Z-shifting and extrusion adjustments.")
     parser.add_argument("input_file", help="Path to the input G-code file")
-    parser.add_argument("-layerHeight", type=float, default=0.2, help="Layer height in mm (default: 0.2mm)")
-    parser.add_argument("-extrusionMultiplier", type=float, default=1, help="Extrusion multiplier for first layer (default: 1.5x)")
+    parser.add_argument("-layerHeight", type=float, default=None, help="Layer height in mm (default: auto-detect)")
+    parser.add_argument("-extrusionMultiplier", type=float, default=1, help="Extrusion multiplier (default: 1.0)")
     args = parser.parse_args()
 
     process_gcode(
