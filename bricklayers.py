@@ -17,6 +17,8 @@ import sys
 import logging
 import os
 import argparse
+import subprocess
+import shutil
 
 # Get the directory where the script is located
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -30,7 +32,63 @@ logging.basicConfig(
     format="%(asctime)s - %(message)s"
 )
 
+# Checks to see if the input file is a binary G-code file
+def is_binary_file(input_file, max_bytes=1024):
+    try:
+        with open(input_file,'rb') as file:
+            return b'\x00' in file.read()
+    except IOError:
+        return False
+
+# Checks if a utility such as bgcode is in the system path or current working directory
+def get_utility_path(utility):
+    try:
+        # Check system path for the utility
+        util_path = shutil.which(utility)
+        if util_path:
+            return util_path
+
+        # Check current directory for the utility
+        cwd_path = os.path.join(os.getcwd(), utility)
+        logging.info(f"Current Working Directory path: {cwd_path}")
+        if os.path.exists(cwd_path):
+            return cwd_path
+
+        # utility not found. Exit the script.
+        raise FileNotFoundError(f"The {utility} utility could not be found. Please make sure it is installed.")
+    except FileNotFoundError as e:
+        error_message = f"An error occurred: {e}"
+        print(error_message, file=sys.stderr)
+        logging.error(error_message)
+        sys.exit(1)
+
+# Convert a file from binary G-code format to regular G-code format and vice-versa
+def convert_gcode(input_file):
+    try:
+        bgcode_path = get_utility_path("bgcode")
+
+        # Convert the input file
+        result = subprocess.run(
+                                [bgcode_path, input_file], 
+                                capture_output=True, 
+                                text=True
+        )
+
+        # Conversion succeeded!
+        if result.returncode == 0:
+            logging.info('Binary G-code conversion was successful!')
+            return True
+
+        # Conversion failed
+        raise Exception(f"Failed to perform binary G-code conversion. Error output: {result.stdout} {result.stderr}")
+    except (subprocess.CalledProcessError, Exception) as e:
+        error_message = f"Conversion failed: {e}"
+        print(error_message, file=sys.stderr)
+        logging.error(error_message)
+        sys.exit(1)
+
 def process_gcode(input_file, layer_height, extrusion_multiplier):
+    generate_binary_gcode = False
     current_layer = 0
     current_z = 0.0
     perimeter_type = None
@@ -41,7 +99,19 @@ def process_gcode(input_file, layer_height, extrusion_multiplier):
     logging.info(f"Input file: {input_file}")
     logging.info(f"Z-shift: {z_shift} mm, Layer height: {layer_height} mm")
 
-    # Read the input G-code
+    # If it's a binary G-code file, convert it back into a regular G-code file for modification
+    if is_binary_file(input_file):
+        logging.info('Binary G-code detected!')
+        generate_binary_gcode = True
+
+        if not input_file.endswith('.bgcode'):
+            binary_input_file = f"{input_file}.bgcode"
+            os.rename(input_file, binary_input_file)
+            convert_gcode(binary_input_file)
+            os.remove(binary_input_file)
+            os.rename(f"{input_file}.gcode", input_file)
+
+    # Read the input G-code.
     with open(input_file, 'r') as infile:
         lines = infile.readlines()
 
@@ -124,6 +194,16 @@ def process_gcode(input_file, layer_height, extrusion_multiplier):
     # Overwrite the input file with the modified G-code
     with open(input_file, 'w') as outfile:
         outfile.writelines(modified_lines)
+
+    # Convert the G-code back to binary G-code format
+    if generate_binary_gcode:
+        logging.info("Converting G-code to back to binary G-code")
+        if not input_file.endswith('.gcode'):
+            binary_outfile = f"{input_file}.gcode"
+            os.rename(input_file, binary_outfile)
+            convert_gcode(binary_outfile)
+            os.remove(binary_outfile)
+            os.rename(f"{input_file}.bgcode", input_file)
 
     logging.info("G-code processing completed")
     logging.info(f"Log file saved at {log_file_path}")
