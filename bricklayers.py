@@ -131,17 +131,17 @@ def process_gcode(input_file, layer_height, extrusion_multiplier):
 # Main execution
 if __name__ == "__main__":
 
+    default_layerHeight = float(os.environ.get('SLIC3R_Layer_height', 0.2))
+    default_extrusionMultiplier = float(os.environ.get('SLIC3R_Extrusion_multiplier', 1.5))
+
     parser = argparse.ArgumentParser(description="Post-process G-code for Z-shifting and extrusion adjustments.")
     parser.add_argument("input_file", help="Path to the input G-code file")
-    parser.add_argument("-layerHeight", type=float, default=None, help="Layer height in mm (default: 0.2mm)")
-    parser.add_argument("-extrusionMultiplier", type=float, default=None, help="Extrusion multiplier for first layer (default: 1.5x)")
+    parser.add_argument("-layerHeight", type=float, default=default_layerHeight, help="Layer height in mm (default: 0.2mm)")
+    parser.add_argument("-extrusionMultiplier", type=float, default=default_extrusionMultiplier, help="Extrusion multiplier for first layer (default: 1.5x)")
     args = parser.parse_args()
-
-    layerHeight = args.layerHeight or float(os.environ.get('SLIC3R_Layer_height', 0.2))
-    extrusionMultiplier = args.extrusionMultiplier or float(os.environ.get('SLIC3R_Extrusion_multiplier', 1.5))
 
     process_gcode(
         input_file=args.input_file,
-        layer_height=layerHeight,
-        extrusion_multiplier=extrusionMultiplier,
+        layer_height=args.layerHeight,
+        extrusion_multiplier=args.extrusionMultiplier,
     )
