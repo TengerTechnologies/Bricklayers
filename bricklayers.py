@@ -32,7 +32,7 @@ logging.basicConfig(
     format="%(asctime)s - %(message)s"
 )
 
-# searches a line of the gcode file
+# Searches a line of the gcode file
 # looking for comments which would indicate
 # the layer height the model was sliced at
 def get_layer_height_from_gcode(line):
@@ -119,10 +119,19 @@ def process_gcode(input_file, args_layer_height, extrusion_multiplier):
         bgcode_path = get_utility_path("bgcode")
         
         # bgcode not found. Cannot continue.
+        # Tell the users and list out the paths where
         if not bgcode_path:
-            error_message = "The bgcode utility is required in order to modify binary G-code files. Please install it or disable binary G-code generation in your slicer."
+            error_message = "The bgcode utility is required in order to modify binary G-code files.\n\nPlease install in one of the paths below or disable binary G-code generation in your slicer.\n\n"
             print(error_message, file=sys.stderr)
             logging.error(error_message)
+
+            # Tell the users where bgcode should be installed
+            # for it to be found by this script
+            paths = os.environ.get('PATH', '').split(os.pathsep)
+            for path in paths:
+                print(path, file=sys.stderr)
+                logging.error(path)
+
             sys.exit(1)
 
         # File extension needs to be .bgcode for bgcode
