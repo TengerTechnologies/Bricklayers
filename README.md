@@ -1,6 +1,6 @@
 This is a script to add Brick layers to Prusaslicer and Orcaslicer.
 (As of now it doesn't work with Bambu printers)
-
+text edit
 To use it you need to have Python installed. (www.python.org) 
 
 In Prusaslicer's printsettings go to "Output options". There you will find a section called "Post processing scripts". 
