@@ -32,6 +32,28 @@ logging.basicConfig(
     format="%(asctime)s - %(message)s"
 )
 
+# searches a line of the gcode file
+# looking for comments which would indicate
+# the layer height the model was sliced at
+def get_layer_height_from_gcode(line):
+
+    # Different printers specify layer heights in comments differently
+    # so we'll need different regex patterns to search for
+    layer_height_patterns = [
+            r';\s+layer_height\s+=\s+(\d+\.\d+)', # Prusa
+            r';\s+Z_HEIGHT:\s+(\d+\.\d+)' # Bambu Labs
+        ]
+
+    # Only check comments for matches
+    if line.startswith(';'):
+        for pattern in layer_height_patterns:
+            match = re.search(pattern, line)
+            if match:
+                return float(match.group(1))
+
+    # No matches found
+    return None
+
 # Checks to see if the input file is a binary G-code file
 def is_binary_file(input_file, max_bytes=1024):
     try:
@@ -79,17 +101,15 @@ def convert_gcode(input_file, bgcode_path):
         logging.error(error_message)
         sys.exit(1)
 
-def process_gcode(input_file, layer_height, extrusion_multiplier):
+def process_gcode(input_file, args_layer_height, extrusion_multiplier):
     generate_binary_gcode = False
     current_layer = 0
     current_z = 0.0
     perimeter_type = None
     perimeter_block_count = 0
     inside_perimeter_block = False
-    z_shift = layer_height * 0.5
     logging.info("Starting G-code processing")
     logging.info(f"Input file: {input_file}")
-    logging.info(f"Z-shift: {z_shift} mm, Layer height: {layer_height} mm")
 
     # If it's a binary G-code file, convert it back into a regular G-code file for modification
     if is_binary_file(input_file):
@@ -123,6 +143,23 @@ def process_gcode(input_file, layer_height, extrusion_multiplier):
     # Read the input G-code.
     with open(input_file, 'r') as infile:
         lines = infile.readlines()
+
+    # Try to pull layer_height from G-code comments
+    # check each line for layer height information
+    for line in lines:
+        layer_height = get_layer_height_from_gcode(line)
+
+        # Break the for loop once a valid layer_height has been found
+        if layer_height is not None:
+            logging.info(f"Found layer height in G-code comments")
+            break
+
+    # Use the value from command line args
+    if layer_height is None:
+        layer_height = args_layer_height
+
+    z_shift = layer_height * 0.5
+    logging.info(f"Z-shift: {z_shift} mm, Layer height: {layer_height} mm")
 
     # Identify the total number of layers by looking for `G1 Z` commands
     total_layers = sum(1 for line in lines if line.startswith("G1 Z"))
@@ -227,6 +264,6 @@ if __name__ == "__main__":
 
     process_gcode(
         input_file=args.input_file,
-        layer_height=args.layerHeight,
+        args_layer_height=args.layerHeight,
         extrusion_multiplier=args.extrusionMultiplier,
     )
