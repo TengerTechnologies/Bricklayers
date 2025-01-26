@@ -252,7 +252,7 @@ def process_gcode(input_file, args_layer_height, extrusion_multiplier):
 
     # Convert the G-code back to binary G-code format
     if generate_binary_gcode:
-        logging.info("Converting G-code to back to binary G-code")
+        logging.info("Converting G-code back to binary G-code")
         if not input_file.endswith('.gcode'):
             tempfile = f"{input_file}.gcode"
             os.rename(input_file, tempfile)
