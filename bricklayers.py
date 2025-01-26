@@ -40,8 +40,8 @@ def get_layer_height_from_gcode(line):
     # Different printers specify layer heights in comments differently
     # so we'll need different regex patterns to search for
     layer_height_patterns = [
-            r';\s+layer_height\s+=\s+(\d+\.\d+)', # Prusa
-            r';\s+Z_HEIGHT:\s+(\d+\.\d+)' # Bambu Labs
+            r';\s*layer_height\s*=\s*(\d+(?:\.\d+)?)', # Prusa
+            r';\s*Z_HEIGHT:\s*(\d+(?:\.\d+)?)', # Bambu Labs
         ]
 
     # Only check comments for matches
