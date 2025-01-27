@@ -42,6 +42,7 @@ def get_layer_height_from_gcode(line):
     layer_height_patterns = [
             r';\s*layer_height\s*=\s*(\d+(?:\.\d+)?)', # Prusa
             r';\s*Z_HEIGHT:\s*(\d+(?:\.\d+)?)', # Bambu Labs
+            r';\s*layerHeight,(\d+(?:\.\d+)?)' # Simplify3D
         ]
 
     # Only check comments for matches
