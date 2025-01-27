@@ -154,18 +154,30 @@ def process_gcode(input_file, args_layer_height, extrusion_multiplier):
     with open(input_file, 'r') as infile:
         lines = infile.readlines()
 
-    # Try to pull layer_height from G-code comments
-    # check each line for layer height information
-    for line in lines:
-        layer_height = get_layer_height_from_gcode(line)
+    # Automatic Layer Height detection via environment variables
+    layer_height = os.getenv('SLIC3R_LAYER_HEIGHT')
+    if layer_height is not None:
+        try:
+            layer_height = float(layer_height)
+            logging.info('Found layer height via SLIC3R_LAYER_HEIGHT environment variable')
+        except ValueError:
+            logging.error(f"Invalid value for SLIC3R_LAYER_HEIGHT: {layer_height}")
 
-        # Break the for loop once a valid layer_height has been found
-        if layer_height is not None:
-            logging.info(f"Found layer height in G-code comments")
-            break
-
-    # Use the value from command line args
     if layer_height is None:
+        # Try to pull layer_height from G-code comments
+        # check each line for layer height information
+        for line in lines:
+            layer_height = get_layer_height_from_gcode(line)
+
+            # Break the for loop once a valid layer_height has been found
+            if layer_height is not None:
+                logging.info('Found layer height via G-code comments')
+                break
+
+    # Default to using the layer_height from the command line args
+    # Since we couldn't automatically determine the layer height
+    if layer_height is None:
+        logging.info('Found layer height via a command line argument')
         layer_height = args_layer_height
 
     z_shift = layer_height * 0.5
