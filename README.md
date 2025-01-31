@@ -1,27 +1,85 @@
-This is a script to add Brick layers to Prusaslicer and Orcaslicer.
-(As of now it doesn't work with Bambu printers)
+# Bricklayers G-code Post Processor
 
-To use it you need to have Python installed. (www.python.org) 
+Open-source tool for modifying 3D printing G-code files to alternate Z-axis layer heights on internal perimeters.
 
-In Prusaslicer's printsettings go to "Output options". There you will find a section called "Post processing scripts". 
-You can add the following to run the script:
+[![Demonstration Video](https://img.youtube.com/vi/EqRdQOoK5hc/0.jpg)](https://www.youtube.com/watch?v=EqRdQOoK5hc)
 
-```"C:\Your\Path\To\Python\python.exe" "C:\Your\Path\To\Script\bricklayers.py"```
+## Key Features
 
-This will run it with a default layerheight of 0.2.
+- Compatible with common slicing software output
+- Adjustable Z-axis layer shift patterns
+- Configurable extrusion multipliers
+- Automatic layer height detection
+- Basic geometry validation
 
-There are two parameters you can add. -layerHeight and -extrusionMultiplier
+## Requirements
 
-The layerheight has to match the settings in the slicer to work as intended,
-The extrusionmultiplier multiplies the extrusions of the shifted layers so you can use it to probably increase strenght(has yet to be tested).
+- Python 3.9+ ([python.org](https://www.python.org/))
+- 64-bit operating system recommended
+- 2X free RAM relative to G-code file size
 
-Sample: 
+## Installation
 
-```"C:\Your\Path\To\Python\python.exe" "C:\Your\Path\To\Script\bricklayers.py" -layerheight 0.2 -extrusionMultiplier 1.3```
+1. Install Python dependencies:
 
-Thanks to all of you who opened issues and made pullrequests. I'm not ignoring you, I just didn't have the time to review yet. I will do on the weekend!<3
-(I will also make a good readme then)
+   ```bash
+   pip install shapely
+   pip install psutil # Optional, for memory usage logging
+   ```
+2. Download script:
 
-Here is a video about the script.
+   ```
+   wget https://example.com/bricklayers.py
+   ```
 
-[![IMAGE ALT TEXT HERE](https://img.youtube.com/vi/EqRdQOoK5hc/0.jpg)](https://www.youtube.com/watch?v=EqRdQOoK5hc)
+
+## Usage Instructions
+
+### Basic Configuration
+
+bash
+
+```
+python bricklayers.py input.gcode -layerHeight 0.2
+```
+
+### Full Parameter List
+
+bash
+
+```
+python bricklayers.py input.gcode \
+  -layerHeight 0.2 \
+  -extrusionMultiplier 1.2 \
+  -simplifyTolerance 0.03 \
+  -bgcode \
+  --logLevel INFO
+```
+
+## Technical Notes
+
+* Processes standard G-code (ASCII) and Prusa binary formats
+* Creates backup files with timestamped logs
+* Detailed processing reports in `bricklayers.log`
+
+## Important Disclaimers
+
+This software is provided **as-is** without any warranties. By using this tool, you agree:
+
+1. To validate all processed files in simulation software before printing
+2. That improper use may damage printers or create hazardous conditions
+3. The authors are not liable for material losses or printer damage
+
+> Test on non-critical prints first. Not certified for medical/safety-critical applications.
+
+## License
+
+GNU General Public License v3.0
+
+Copyright © 2025 Roman Tenger
+
+---
+
+*Not affiliated with or endorsed by Prusa Research, Bambu Lab, or Anycubic.
+
+All trademarks remain property of their respective owners.*
