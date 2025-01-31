@@ -15,6 +15,7 @@ import argparse
 from tempfile import NamedTemporaryFile
 from pathlib import Path
 from statistics import median
+import logging.handlers
 
 
 class PrinterType(Enum):
@@ -29,7 +30,8 @@ class GCodeProcessor:
         extrusion_multiplier=1.0,
         min_distance=0.1,
         max_intersection_area=0.5,
-        simplify_tolerance=0.0,
+        simplify_tolerance=0.03,
+        log_level=logging.INFO,
     ):
         self.extrusion_multiplier = extrusion_multiplier
         self.min_distance = min_distance
@@ -43,6 +45,29 @@ class GCodeProcessor:
         self.z_shift = None
         self.shifted_blocks = 0
         self.perimeter_found = False
+
+        # Initialize logger
+        self.logger = logging.getLogger("Bricklayers")
+        self.logger.setLevel(log_level)
+
+        # Prevent duplicate handlers
+        if not self.logger.hasHandlers():
+            formatter = logging.Formatter(
+                "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+            )
+
+            # Rotating file handler
+            file_handler = logging.handlers.RotatingFileHandler(
+                "bricklayers.log", maxBytes=10 * 1024 * 1024, backupCount=5  # 10MB
+            )
+            file_handler.setFormatter(formatter)
+
+            # Console handler
+            console_handler = logging.StreamHandler()
+            console_handler.setFormatter(formatter)
+
+            self.logger.addHandler(file_handler)
+            self.logger.addHandler(console_handler)
 
     def detect_printer_type(self, file_path):
         """Detect printer type using memory-mapped file"""
@@ -79,13 +104,24 @@ class GCodeProcessor:
             return False
         if original.distance(simplified) > self.simplify_tolerance * 1.5:
             return False
+            # Check minimum feature preservation
+        min_dimension = min(
+            original.bounds[2] - original.bounds[0],
+            original.bounds[3] - original.bounds[1],
+        )
+        if min_dimension < 4 * self.simplify_tolerance:
+            return False  # Reject simplification that removes critical features
         return True
 
     def parse_perimeter_paths(self, layer_lines):
-        """Parse perimeter paths with validation for minimum points"""
+        """Parse perimeter paths with validation tracking"""
         perimeter_paths = []
         current_path = []
         current_lines = []
+        skipped_paths = 0
+        self.simplify_success_count = 0  # Reset counter per layer
+
+        self.logger.debug("Starting perimeter path parsing")
 
         for line_idx, line in enumerate(layer_lines):
             if line.startswith("G1") and "X" in line and "Y" in line and "E" in line:
@@ -102,37 +138,57 @@ class GCodeProcessor:
                     if current_path[0] != current_path[-1]:
                         current_path.append(current_path[0])
 
-                    # Validate minimum points for polygon creation
-                    if (
-                        len(current_path) >= 4
-                    ):  # Require at least 3 distinct points + closure
+                    valid_path = False
+                    if len(current_path) >= 4:
                         try:
                             poly = Polygon(current_path)
+                            original_area = poly.area
 
-                            # Apply simplification with validation
+                            # Apply simplification if enabled
                             if self.simplify_tolerance > 0:
                                 simplified = poly.simplify(
                                     self.simplify_tolerance, preserve_topology=True
                                 )
                                 simplified = make_valid(simplified)
 
-                                # Ensure valid geometry after simplification
                                 if (
                                     simplified.is_valid
                                     and len(simplified.exterior.coords) >= 4
                                     and self.validate_simplification(poly, simplified)
                                 ):
+                                    self.simplify_success_count += 1
                                     poly = simplified
 
                             if poly.is_valid and not poly.is_empty:
                                 perimeter_paths.append((poly, current_lines))
+                                valid_path = True
+                                self.logger.debug(
+                                    f"Added path with {len(current_path)} points → "
+                                    f"Area: {poly.area:.2f}mm²"
+                                )
 
                         except Exception as e:
-                            logging.debug(f"Ignoring invalid geometry: {str(e)}")
+                            self.logger.debug(f"Validation failed: {str(e)}")
+                            valid_path = False
+
+                    if valid_path:
+                        self.logger.debug(f"Valid path: {len(current_lines)} commands")
+                    else:
+                        skipped_paths += 1
+                        self.logger.debug(
+                            f"Skipped path at line {line_idx} - "
+                            f"Points: {len(current_path)}, "
+                            f"Closed: {current_path[0] == current_path[-1]}"
+                        )
 
                     current_path = []
                     current_lines = []
 
+        self.logger.info(
+            f"Layer analysis - Valid: {len(perimeter_paths)}, "
+            f"Skipped: {skipped_paths}, "
+            f"Simplified: {self.simplify_success_count}"
+        )
         return perimeter_paths
 
     def _adjust_extrusion(self, line, is_last_layer):
@@ -175,6 +231,7 @@ class GCodeProcessor:
 
     def process_layer(self, layer_lines, layer_num, total_layers):
         """Process a single layer's G-code with geometric analysis"""
+        self.logger.info(f"Processing layer {layer_num+1}/{total_layers}")
         self.current_layer = layer_num
         perimeter_paths = self.parse_perimeter_paths(layer_lines)
         outer_perimeters, inner_perimeters = self.classify_perimeters(perimeter_paths)
@@ -210,6 +267,8 @@ class GCodeProcessor:
                     processed.append(f"G1 Z{self.current_z:.3f} F1200 ; Reset Z\n")
                     in_internal = False
                 processed.append(line)
+        self.logger.debug(f"Internal lines: {len(internal_lines)}")
+        self.logger.debug(f"Shifted blocks: {current_block} in this layer")
         return processed
 
     def process_gcode(self, input_file, is_bgcode=False):
@@ -294,7 +353,7 @@ def main():
     parser.add_argument(
         "-simplifyTolerance",
         type=float,
-        default=0.0,
+        default=0.03,
         help="Simplification tolerance for ISO 2768 compliance",
     )
     parser.add_argument(
@@ -302,10 +361,17 @@ def main():
         action="store_true",
         help="Enable for PrusaSlicer binary G-code processing",
     )
+    parser.add_argument(
+        "--logLevel",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        default="INFO",
+        help="Set logging verbosity level",
+    )
 
     args = parser.parse_args()
 
     processor = GCodeProcessor(
+        log_level=getattr(logging, args.logLevel),
         layer_height=args.layerHeight,
         extrusion_multiplier=args.extrusionMultiplier,
         simplify_tolerance=args.simplifyTolerance,
