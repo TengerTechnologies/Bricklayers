@@ -16,6 +16,7 @@ from tempfile import NamedTemporaryFile
 from pathlib import Path
 from statistics import median
 import logging.handlers
+import psutil
 
 
 class PrinterType(Enum):
@@ -45,6 +46,12 @@ class GCodeProcessor:
         self.z_shift = None
         self.shifted_blocks = 0
         self.perimeter_found = False
+        self.total_z_shifts = 0
+        self.total_extrusion_adjustments = 0
+        self.processing_start = None
+        self.layer_times = []
+        self.simplified_features = 0
+        self.failed_simplifications = 0
 
         # Initialize logger
         self.logger = logging.getLogger("Bricklayers")
@@ -191,6 +198,7 @@ class GCodeProcessor:
                                 )
 
                         except Exception as e:
+                            self.failed_simplifications += 1
                             self.logger.debug(f"Validation failed: {str(e)}")
                             valid_path = False
 
@@ -218,6 +226,7 @@ class GCodeProcessor:
         """Adjust extrusion values with contextual commenting"""
         e_match = re.search(r"E([\d.]+)", line)
         if e_match:
+            self.total_extrusion_adjustments += 1
             e_value = float(e_match.group(1))
             if self.current_layer == 0:
                 new_e = e_value * 1.5
@@ -254,7 +263,14 @@ class GCodeProcessor:
 
     def process_layer(self, layer_lines, layer_num, total_layers):
         """Process a single layer's G-code with geometric analysis"""
-        self.logger.info(f"Processing layer {layer_num+1}/{total_layers}")
+        layer_start = datetime.now()
+        self.logger.info(
+            f"Layer {layer_num+1} complete. "
+            f"Shifted blocks: {current_block} | "
+            f"Internal lines: {len(internal_lines)} | "
+            f"Processing time: {(datetime.now()-layer_start).total_seconds():.2f}s"
+        )
+        self.layer_times.append((datetime.now()-layer_start).total_seconds())
         self.current_layer = layer_num
         perimeter_paths = self.parse_perimeter_paths(layer_lines)
         outer_perimeters, inner_perimeters = self.classify_perimeters(perimeter_paths)
@@ -296,6 +312,7 @@ class GCodeProcessor:
 
     def process_gcode(self, input_file, is_bgcode=False):
         """Main processing with memory-mapped file handling"""
+        self.processing_start = datetime.now()
         script_dir = os.path.dirname(os.path.abspath(__file__))
         current_time = datetime.now().astimezone().strftime("%Y-%m-%d_%H-%M-%S_GMT%z")
         log_filename = os.path.join(script_dir, f"z_shift_{current_time}.log")
@@ -358,8 +375,31 @@ class GCodeProcessor:
             input_path.unlink()
 
         logging.info(f"Processed {self.shifted_blocks} internal perimeter blocks")
+        logging.info(
+                "════════════════════ Processing Complete ════════════════════\n"
+                f"Total Layers Processed: {self.total_layers}\n"
+                f"Total Z-Shifts Applied: {self.shifted_blocks}\n"
+                f"Extrusion Adjustments: {self.total_extrusion_adjustments}\n"
+                f"Simplified Features: {self.simplify_success_count}\n"
+                f"Failed Simplifications: {self.failed_simplifications}\n"
+                f"Average Layer Time: {sum(self.layer_times)/len(self.layer_times):.2f}s\n"
+                f"Total Processing Time: {(datetime.now()-self.processing_start).total_seconds():.2f}s\n"
+                f"Peak Memory Usage: {self.get_memory_usage():.2f}MB\n"
+                "═════════════════════════════════════════════════════════════"
+            )
         return input_path
 
+    def get_memory_usage(self):
+        """Get process memory usage in MB"""
+        try:
+            import psutil
+            process = psutil.Process(os.getpid())
+            return process.memory_info().rss / 1024 ** 2
+        except ImportError:
+            return 0.0  # Return 0 if psutil not installed
+        except Exception as e:
+            self.logger.warning(f"Memory tracking failed: {str(e)}")
+            return 0.0
 
 def main():
     parser = argparse.ArgumentParser(
