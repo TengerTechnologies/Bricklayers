@@ -1,4 +1,4 @@
-# Previous copyright and license headers remain unchanged
+
 
 from datetime import datetime
 import mmap
@@ -96,22 +96,36 @@ class GCodeProcessor:
             raise ValueError("Not enough Z values to detect layer height.")
         return median([z_values[i + 1] - z_values[i] for i in range(len(z_values) - 1)])
 
+    def dynamic_simplification_tolerance(self, poly: Polygon) -> float:
+        """Calculate tolerance based on feature size"""
+        bounds = poly.bounds
+        min_dimension = min(
+            bounds[2] - bounds[0], bounds[3] - bounds[1]  # Width
+        )  # Height
+
+        # Use 10% of feature size but never less than user-specified minimum
+        return max(self.simplify_tolerance, min_dimension * 0.1)
+
     def validate_simplification(self, original: Polygon, simplified: Polygon) -> bool:
-        """Validate simplified geometry meets medical standards"""
+        """Enhanced validation with dynamic thresholds"""
         if not simplified.is_valid:
             return False
-        if abs(original.area - simplified.area) / original.area > 0.02:
-            return False
-        if original.distance(simplified) > self.simplify_tolerance * 1.5:
-            return False
-            # Check minimum feature preservation
+
+        # Calculate relative deviations
+        area_deviation = abs(original.area - simplified.area) / original.area
+        max_distance = original.hausdorff_distance(simplified)
+
+        # Dynamic thresholds based on feature size
         min_dimension = min(
             original.bounds[2] - original.bounds[0],
             original.bounds[3] - original.bounds[1],
         )
-        if min_dimension < 4 * self.simplify_tolerance:
-            return False  # Reject simplification that removes critical features
-        return True
+
+        return (
+            area_deviation < 0.02
+            and max_distance < min_dimension * 0.15
+            and len(simplified.exterior.coords) >= 4
+        )
 
     def parse_perimeter_paths(self, layer_lines):
         """Parse perimeter paths with validation tracking"""
@@ -146,9 +160,18 @@ class GCodeProcessor:
 
                             # Apply simplification if enabled
                             if self.simplify_tolerance > 0:
-                                simplified = poly.simplify(
-                                    self.simplify_tolerance, preserve_topology=True
+                                dynamic_tolerance = (
+                                    self.dynamic_simplification_tolerance(poly)
                                 )
+                                self.logger.debug(
+                                    f"Using adaptive tolerance: {dynamic_tolerance:.3f}mm"
+                                )
+
+                                simplified = poly.simplify(
+                                    dynamic_tolerance,  # Changed from self.simplify_tolerance
+                                    preserve_topology=True,
+                                )
+
                                 simplified = make_valid(simplified)
 
                                 if (
