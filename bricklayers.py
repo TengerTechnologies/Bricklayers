@@ -26,6 +26,7 @@ from pathlib import Path
 from shapely.geometry import Polygon
 from shapely.strtree import STRtree
 from statistics import median
+from datetime import datetime, timezone
 
 
 class PrinterType(Enum):
@@ -194,8 +195,11 @@ class GCodeProcessor:
     def process_gcode(self, input_file, is_bgcode=False):
         """Main processing workflow with layer buffering"""
         script_dir = os.path.dirname(os.path.abspath(__file__))
+        now = datetime.now().astimezone()
+        timestamp = now.strftime("%Y-%m-%d_%H-%M-%S_%Z%z").replace(":", "-")
+        log_filename = os.path.join(script_dir, f"z_shift_{timestamp}.log")
         logging.basicConfig(
-            filename=os.path.join(script_dir, "z_shift_log.txt"),
+            filename=log_filename,
             level=logging.INFO,
             format="%(asctime)s - %(message)s",
         )
