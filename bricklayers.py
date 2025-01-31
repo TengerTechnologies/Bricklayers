@@ -1,5 +1,3 @@
-
-
 from datetime import datetime
 import mmap
 from shapely.geometry import Polygon
@@ -10,13 +8,11 @@ import os
 import re
 import sys
 from enum import Enum
-from typing import List, Tuple, Optional
 import argparse
 from tempfile import NamedTemporaryFile
 from pathlib import Path
 from statistics import median
 import logging.handlers
-import psutil
 
 
 class PrinterType(Enum):
@@ -264,13 +260,8 @@ class GCodeProcessor:
     def process_layer(self, layer_lines, layer_num, total_layers):
         """Process a single layer's G-code with geometric analysis"""
         layer_start = datetime.now()
-        self.logger.info(
-            f"Layer {layer_num+1} complete. "
-            f"Shifted blocks: {current_block} | "
-            f"Internal lines: {len(internal_lines)} | "
-            f"Processing time: {(datetime.now()-layer_start).total_seconds():.2f}s"
-        )
-        self.layer_times.append((datetime.now()-layer_start).total_seconds())
+
+        # Initialize variables first
         self.current_layer = layer_num
         perimeter_paths = self.parse_perimeter_paths(layer_lines)
         outer_perimeters, inner_perimeters = self.classify_perimeters(perimeter_paths)
@@ -280,9 +271,10 @@ class GCodeProcessor:
             internal_lines.update(lines)
 
         processed = []
-        current_block = 0
+        current_block = 0  # Initialize here
         in_internal = False
 
+        # Process lines
         for line_idx, line in enumerate(layer_lines):
             if line.startswith("G1 Z"):
                 z_match = re.search(r"Z([\d.]+)", line)
@@ -306,8 +298,19 @@ class GCodeProcessor:
                     processed.append(f"G1 Z{self.current_z:.3f} F1200 ; Reset Z\n")
                     in_internal = False
                 processed.append(line)
+
+        # Move logging to AFTER processing
+        self.logger.info(
+            f"Layer {layer_num+1} complete. "
+            f"Shifted blocks: {current_block} | "
+            f"Internal lines: {len(internal_lines)} | "
+            f"Processing time: {(datetime.now()-layer_start).total_seconds() * 1000:.2f}ms"  # Changed to ms
+        )
+        self.layer_times.append((datetime.now() - layer_start).total_seconds())
+
         self.logger.debug(f"Internal lines: {len(internal_lines)}")
         self.logger.debug(f"Shifted blocks: {current_block} in this layer")
+
         return processed
 
     def process_gcode(self, input_file, is_bgcode=False):
@@ -376,30 +379,32 @@ class GCodeProcessor:
 
         logging.info(f"Processed {self.shifted_blocks} internal perimeter blocks")
         logging.info(
-                "════════════════════ Processing Complete ════════════════════\n"
-                f"Total Layers Processed: {self.total_layers}\n"
-                f"Total Z-Shifts Applied: {self.shifted_blocks}\n"
-                f"Extrusion Adjustments: {self.total_extrusion_adjustments}\n"
-                f"Simplified Features: {self.simplify_success_count}\n"
-                f"Failed Simplifications: {self.failed_simplifications}\n"
-                f"Average Layer Time: {sum(self.layer_times)/len(self.layer_times):.2f}s\n"
-                f"Total Processing Time: {(datetime.now()-self.processing_start).total_seconds():.2f}s\n"
-                f"Peak Memory Usage: {self.get_memory_usage():.2f}MB\n"
-                "═════════════════════════════════════════════════════════════"
-            )
+            "════════════════════ Processing Complete ════════════════════\n"
+            f"Total Layers Processed: {self.total_layers}\n"
+            f"Total Z-Shifts Applied: {self.shifted_blocks}\n"
+            f"Extrusion Adjustments: {self.total_extrusion_adjustments}\n"
+            f"Simplified Features: {self.simplify_success_count}\n"
+            f"Failed Simplifications: {self.failed_simplifications}\n"
+            f"Average Layer Time: {sum(self.layer_times)/len(self.layer_times) * 1000:.2f}ms\n"  # Changed to ms
+            f"Total Processing Time: {(datetime.now()-self.processing_start).total_seconds() * 1000:.2f}ms\n"  # Changed to ms
+            f"Peak Memory Usage: {self.get_memory_usage():.2f}MB\n"
+            "═════════════════════════════════════════════════════════════"
+        )
         return input_path
 
     def get_memory_usage(self):
         """Get process memory usage in MB"""
         try:
             import psutil
+
             process = psutil.Process(os.getpid())
-            return process.memory_info().rss / 1024 ** 2
+            return process.memory_info().rss / 1024**2
         except ImportError:
             return 0.0  # Return 0 if psutil not installed
         except Exception as e:
             self.logger.warning(f"Memory tracking failed: {str(e)}")
             return 0.0
+
 
 def main():
     parser = argparse.ArgumentParser(
