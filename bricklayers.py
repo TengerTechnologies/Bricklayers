@@ -133,7 +133,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Post-process G-code for Z-shifting and extrusion adjustments.")
     parser.add_argument("input_file", help="Path to the input G-code file")
     parser.add_argument("-layerHeight", type=float, default=0.2, help="Layer height in mm (default: 0.2mm)")
-    parser.add_argument("-extrusionMultiplier", type=float, default=1, help="Extrusion multiplier for first layer (default: 1.5x)")
+    parser.add_argument("-extrusionMultiplier", type=float, default=1, help="Extrusion multiplier for first layer (default: 1.0x)")
     args = parser.parse_args()
 
     process_gcode(
