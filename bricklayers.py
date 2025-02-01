@@ -21,7 +21,6 @@ from shapely.validation import make_valid
 import logging
 import os
 import re
-import sys
 from enum import Enum
 import argparse
 from tempfile import NamedTemporaryFile
