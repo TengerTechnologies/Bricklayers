@@ -42,7 +42,7 @@ def process_gcode(input_file, layer_height, extrusion_multiplier):
     logging.info(f"Z-shift: {z_shift} mm, Layer height: {layer_height} mm")
 
     # Read the input G-code
-    with open(input_file, 'r') as infile:
+    with open(input_file, 'r+') as infile:
         lines = infile.readlines()
 
     # Identify the total number of layers by looking for `G1 Z` commands
@@ -68,7 +68,7 @@ def process_gcode(input_file, layer_height, extrusion_multiplier):
             perimeter_type = "external"
             inside_perimeter_block = False
             logging.info(f"External perimeter detected at layer {current_layer}")
-        elif ";TYPE:Perimeter" in line or ";TYPE:Inner wall" in line:
+        elif ";TYPE:Perimeter" in line or ";TYPE:Internal perimeter" in line or ";TYPE:Inner wall" in line:
             perimeter_type = "internal"
             inside_perimeter_block = False
             logging.info(f"Internal perimeter block started at layer {current_layer}")
@@ -112,7 +112,7 @@ def process_gcode(input_file, layer_height, extrusion_multiplier):
                         line += f" ; Adjusted E for last layer, block #{perimeter_block_count}\n"
                     else: 
                         new_e_value = e_value * extrusion_multiplier
-                        logging.info(f"Multiplying E value by extrusionMultiplier")
+                        logging.info(f"Multiplying E value by extrusionMultiplier: {extrusion_multiplier:.5f}")
                         line = re.sub(r'E[-\d.]+', f'E{new_e_value:.5f}', line).strip()
                         line += f" ; Adjusted E for extrusionMultiplier, block #{perimeter_block_count}\n"
 						
@@ -121,18 +121,24 @@ def process_gcode(input_file, layer_height, extrusion_multiplier):
 
         modified_lines.append(line)
 
+    logging.info(f"Overwrite the input file with the modified G-code: {input_file}")
+
     # Overwrite the input file with the modified G-code
-    with open(input_file, 'w') as outfile:
+    with open(input_file, mode='w+', encoding='UTF-8') as outfile:
         outfile.writelines(modified_lines)
+        outfile.close()
 
     logging.info("G-code processing completed")
     logging.info(f"Log file saved at {log_file_path}")
 
 # Main execution
 if __name__ == "__main__":
+
+    layerHeight = str(os.getenv('SLIC3R_LAYER_HEIGHT'))
+                 
     parser = argparse.ArgumentParser(description="Post-process G-code for Z-shifting and extrusion adjustments.")
     parser.add_argument("input_file", help="Path to the input G-code file")
-    parser.add_argument("-layerHeight", type=float, default=0.2, help="Layer height in mm (default: 0.2mm)")
+    parser.add_argument("-layerHeight", type=float, default=layerHeight, help="Layer height in mm (default: 0.2mm)")
     parser.add_argument("-extrusionMultiplier", type=float, default=1, help="Extrusion multiplier for first layer (default: 1.5x)")
     args = parser.parse_args()
 

@@ -9,7 +9,7 @@ You can add the following to run the script:
 
 ```"C:\Your\Path\To\Python\python.exe" "C:\Your\Path\To\Script\bricklayers.py"```
 
-This will run it with a default layerheight of 0.2.
+This will run it with a layerheight set to environment variable SLIC3R_LAYER_HEIGHT.
 
 There are two parameters you can add. -layerHeight and -extrusionMultiplier
 
@@ -18,7 +18,10 @@ The extrusionmultiplier multiplies the extrusions of the shifted layers so you c
 
 Sample: 
 
-```"C:\Your\Path\To\Python\python.exe" "C:\Your\Path\To\Script\bricklayers.py" -layerheight 0.2 -extrusionMultiplier 1.3```
+Windows
+```"C:\Your\Path\To\Python\python.exe" "C:\Your\Path\To\Script\bricklayers.py" -extrusionMultiplier 1.3```
+Macos
+/opt/homebrew/anaconda3/bin/python ~/Development/Bricklayers/bricklayers.py -extrusionMultiplier 1.1
 
 Thanks to all of you who opened issues and made pullrequests. I'm not ignoring you, I just didn't have the time to review yet. I will do on the weekend!<3
 (I will also make a good readme then)
