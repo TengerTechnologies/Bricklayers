@@ -17,6 +17,8 @@ import sys
 import logging
 import os
 import argparse
+import subprocess
+import shutil
 
 # Get the directory where the script is located
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -30,20 +32,156 @@ logging.basicConfig(
     format="%(asctime)s - %(message)s"
 )
 
-def process_gcode(input_file, layer_height, extrusion_multiplier):
+# Searches a line of the gcode file
+# looking for comments which would indicate
+# the layer height the model was sliced at
+def get_layer_height_from_gcode(line):
+
+    # Different printers specify layer heights in comments differently
+    # so we'll need different regex patterns to search for
+    layer_height_patterns = [
+            r';\s*layer_height\s*=\s*(\d+(?:\.\d+)?)', # Prusa
+            r';\s*Z_HEIGHT:\s*(\d+(?:\.\d+)?)', # Bambu Labs
+            r';\s*layerHeight,(\d+(?:\.\d+)?)' # Simplify3D
+        ]
+
+    # Only check comments for matches
+    if line.startswith(';'):
+        for pattern in layer_height_patterns:
+            match = re.search(pattern, line)
+            if match:
+                return float(match.group(1))
+
+    # No matches found
+    return None
+
+# Checks to see if the input file is a binary G-code file
+def is_binary_file(input_file, max_bytes=1024):
+    try:
+        with open(input_file,'rb') as file:
+            return b'\x00' in file.read()
+    except IOError:
+        return False
+
+# Checks if a utility such as bgcode is in the system path or current working directory
+def get_utility_path(utility):
+    # Check system path for the utility
+    util_path = shutil.which(utility)
+    if util_path:
+        return util_path
+
+    # Check current directory for the utility
+    cwd_path = os.path.join(os.getcwd(), utility)
+    logging.info(f"Current Working Directory path: {cwd_path}")
+    if os.path.exists(cwd_path):
+        return cwd_path
+
+    # utility was not found on the system
+    return False
+
+# Convert a file from binary G-code format to regular G-code format and vice-versa
+def convert_gcode(input_file, bgcode_path):
+    try:
+        # Convert the input file
+        result = subprocess.run(
+                                [bgcode_path, input_file], 
+                                capture_output=True, 
+                                text=True
+        )
+
+        # Conversion succeeded!
+        if result.returncode == 0:
+            logging.info('Binary G-code conversion was successful!')
+            return True
+
+        # Conversion failed
+        raise Exception(f"Failed to perform binary G-code conversion. Error output: {result.stdout} {result.stderr}")
+    except (subprocess.CalledProcessError, Exception) as e:
+        error_message = f"Conversion failed: {e}"
+        print(error_message, file=sys.stderr)
+        logging.error(error_message)
+        sys.exit(1)
+
+def process_gcode(input_file, args_layer_height, extrusion_multiplier):
+    generate_binary_gcode = False
     current_layer = 0
     current_z = 0.0
     perimeter_type = None
     perimeter_block_count = 0
     inside_perimeter_block = False
-    z_shift = layer_height * 0.5
     logging.info("Starting G-code processing")
     logging.info(f"Input file: {input_file}")
-    logging.info(f"Z-shift: {z_shift} mm, Layer height: {layer_height} mm")
 
-    # Read the input G-code
+    # If it's a binary G-code file, convert it back into a regular G-code file for modification
+    if is_binary_file(input_file):
+        logging.info('Binary G-code detected!')
+
+        # Get the path to the bgcode binary
+        bgcode_path = get_utility_path("bgcode")
+        
+        # bgcode not found. Cannot continue.
+        # Tell the users and list out the paths where
+        if not bgcode_path:
+            error_message = "The bgcode utility is required in order to modify binary G-code files.\n\nPlease install in one of the paths below or disable binary G-code generation in your slicer.\n\n"
+            print(error_message, file=sys.stderr)
+            logging.error(error_message)
+
+            # Tell the users where bgcode should be installed
+            # for it to be found by this script
+            paths = os.environ.get('PATH', '').split(os.pathsep)
+            for path in paths:
+                print(path, file=sys.stderr)
+                logging.error(path)
+
+            sys.exit(1)
+
+        # File extension needs to be .bgcode for bgcode
+        # to convert it correctly.
+        if not input_file.endswith('.bgcode'):
+            binary_input_file = f"{input_file}.bgcode"
+            os.rename(input_file, binary_input_file)
+
+            # Convert the binary G-code into regular G-code
+            convert_gcode(binary_input_file, bgcode_path)
+
+            # Rename the converted gcode file back to its original name
+            os.rename(f"{input_file}.gcode", input_file)
+
+        # Inform the script to perform G-code to binary G-code conversion at the end
+        generate_binary_gcode = True
+
+    # Read the input G-code.
     with open(input_file, 'r') as infile:
         lines = infile.readlines()
+
+    # Automatic Layer Height detection via environment variables
+    layer_height = os.getenv('SLIC3R_LAYER_HEIGHT')
+    if layer_height is not None:
+        try:
+            layer_height = float(layer_height)
+            logging.info('Found layer height via SLIC3R_LAYER_HEIGHT environment variable')
+        except ValueError:
+            logging.error(f"Invalid value for SLIC3R_LAYER_HEIGHT: {layer_height}")
+
+    if layer_height is None:
+        # Try to pull layer_height from G-code comments
+        # check each line for layer height information
+        for line in lines:
+            layer_height = get_layer_height_from_gcode(line)
+
+            # Break the for loop once a valid layer_height has been found
+            if layer_height is not None:
+                logging.info('Found layer height via G-code comments')
+                break
+
+    # Default to using the layer_height from the command line args
+    # Since we couldn't automatically determine the layer height
+    if layer_height is None:
+        logging.info('Found layer height via a command line argument')
+        layer_height = args_layer_height
+
+    z_shift = layer_height * 0.5
+    logging.info(f"Z-shift: {z_shift} mm, Layer height: {layer_height} mm")
 
     # Identify the total number of layers by looking for `G1 Z` commands
     total_layers = sum(1 for line in lines if line.startswith("G1 Z"))
@@ -125,6 +263,16 @@ def process_gcode(input_file, layer_height, extrusion_multiplier):
     with open(input_file, 'w') as outfile:
         outfile.writelines(modified_lines)
 
+    # Convert the G-code back to binary G-code format
+    if generate_binary_gcode:
+        logging.info("Converting G-code back to binary G-code")
+        if not input_file.endswith('.gcode'):
+            tempfile = f"{input_file}.gcode"
+            os.rename(input_file, tempfile)
+            convert_gcode(tempfile, bgcode_path)
+            os.remove(tempfile)
+            os.rename(f"{input_file}.bgcode", input_file)
+
     logging.info("G-code processing completed")
     logging.info(f"Log file saved at {log_file_path}")
 
@@ -138,6 +286,6 @@ if __name__ == "__main__":
 
     process_gcode(
         input_file=args.input_file,
-        layer_height=args.layerHeight,
+        args_layer_height=args.layerHeight,
         extrusion_multiplier=args.extrusionMultiplier,
     )
