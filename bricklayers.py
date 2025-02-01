@@ -50,7 +50,7 @@ class GCodeProcessor:
         simplify_tolerance=0.03,
         log_level=logging.INFO,
     ):
-        """High-reliability G-code processor for critical manufacturing applications.
+        """High-reliability G-code processor for manufacturing applications.
 
         Args:
             layer_height: Manual override when auto-detection insufficient (mm)
