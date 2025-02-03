@@ -114,6 +114,7 @@ class GCodeProcessor:
         self.vertical_shift = 0.5  # Fraction of layer height to shift
         self.layer_parity = 1  # Track even/odd layers
         self.actual_z = 0.0  # Track printed Z
+        self.current_z = 0.0  # 👈 Track actual printed Z
 
         # Regex patterns
         self.re_z = re.compile(r"Z([\d.]+)")
@@ -457,21 +458,17 @@ class GCodeProcessor:
 
         processed = []
         z_shift_applied = False  # Track if we've processed the Z shift
+        layer_z = None  # Track this layer's Z
 
         for line in layer_lines:
-            original_line = line
-
-            # Apply vertical Z-shift ONLY to the first G1 Z in the layer
-            if (
-                self.full_layer_shifts
-                and not z_shift_applied
-                and line.startswith("G1 Z")
-            ):
+            if not z_shift_applied and line.startswith("G1 Z"):
                 z_match = self.re_z.search(line)
                 if z_match:
-                    current_z = float(z_match.group(1))
-                    new_z = current_z + shift_amount
-                    line = f"G1 Z{new_z:.3f} F{self.z_speed} ; SHIFT_APPLIED ({shift_amount:.3f}mm)\n"
+                    # Calculate new Z based on prior layer's actual Z
+                    self.current_z += self.layer_height  # 👈 Progress layer height
+                    shift_amount = self.layer_parity * self.layer_height * 0.5
+                    layer_z = self.current_z + shift_amount
+                    line = f"G1 Z{layer_z:.3f} F{self.z_speed} ; SHIFT_APPLIED ({shift_amount:.3f}mm)\n"
                     z_shift_applied = True
 
             # Apply lateral X/Y shifts to perimeters
@@ -491,6 +488,8 @@ class GCodeProcessor:
 
             processed.append(line)
 
+        if layer_z is not None:
+            self.current_z = layer_z  # 👈 Update for next layer
         self.layer_times.append((datetime.now() - layer_start).total_seconds())
         self.logger.info(
             f"Layer {layer_num+1}: Z-shift={shift_amount:.3f}mm, XY-shift={x_offset:.3f}mm"
