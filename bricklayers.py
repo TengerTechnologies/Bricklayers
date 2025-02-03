@@ -67,7 +67,7 @@ class GCodeProcessor:
 
         # Unified logging configuration
         self._configure_logging(log_level)
-        
+
     def decode_line(self, line_bytes):
         try:
             return line_bytes.decode("utf-8")
@@ -166,11 +166,11 @@ class GCodeProcessor:
         bounds = poly.bounds
         width = bounds[2] - bounds[0]
         height = bounds[3] - bounds[1]
-        
+
         # Handle degenerate geometries with zero/negative dimensions
         if width <= 0.0 or height <= 0.0:
             return self.simplify_tolerance
-            
+
         min_dimension = min(width, height)
         return max(self.simplify_tolerance, min_dimension * 0.1)
 
@@ -411,6 +411,7 @@ class GCodeProcessor:
     def process_gcode(self, input_file, is_bgcode=False):
         self.processing_start = datetime.now()
         script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.temp_path = None  # Track temporary file path at instance level
 
         # Generate timestamped log filename
         current_time = datetime.now().astimezone().strftime("%Y-%m-%d_%H-%M-%S_GMT%z")
@@ -460,35 +461,44 @@ class GCodeProcessor:
                     self.logger.info(f"Found {self.total_layers} layers to process")
 
                     with NamedTemporaryFile(mode="w", delete=False) as temp_file:
+                        self.temp_path = temp_file.name  # Capture path immediately
                         layer_buffer = []
                         current_layer = 0
 
                         self.logger.info("Begin layer processing...")
-                        for line in iter(mm.readline, b""):
-                            decoded_line = decoded_line = self.decode_line(line)
-                            layer_buffer.append(decoded_line)
+                        try:
+                            for line in iter(mm.readline, b""):
+                                decoded_line = decoded_line = self.decode_line(line)
+                                layer_buffer.append(decoded_line)
 
-                            if (
-                                decoded_line.startswith("G1 Z")
-                                or "; CHANGE_LAYER" in decoded_line
-                            ):
-                                if layer_buffer:
-                                    processed = self.process_layer(
-                                        layer_buffer, current_layer, self.total_layers
-                                    )
-                                    temp_file.writelines(processed)
-                                    current_layer += 1
-                                    layer_buffer = []
+                                if (
+                                    decoded_line.startswith("G1 Z")
+                                    or "; CHANGE_LAYER" in decoded_line
+                                ):
+                                    if layer_buffer:
+                                        processed = self.process_layer(
+                                            layer_buffer,
+                                            current_layer,
+                                            self.total_layers,
+                                        )
+                                        temp_file.writelines(processed)
+                                        current_layer += 1
+                                        layer_buffer = []
 
-                        if layer_buffer:
-                            processed = self.process_layer(
-                                layer_buffer, current_layer, self.total_layers
+                            if layer_buffer:
+                                processed = self.process_layer(
+                                    layer_buffer, current_layer, self.total_layers
+                                )
+                                temp_file.writelines(processed)
+                        except Exception as e:
+                            self.logger.error(
+                                f"Critical error during processing: {str(e)}"
                             )
-                            temp_file.writelines(processed)
+                            raise  # Re-raise to trigger finally cleanup
 
-                        temp_path = temp_file.name
-
-                    os.replace(temp_path, input_path)
+                    # Only reach here if processing completed successfully
+                    os.replace(self.temp_path, input_path)
+                    self.temp_path = None  # Successfully replaced, clear cleanup flag
                     self.logger.info(f"Processed file saved to: {input_path}")
 
             if is_bgcode:
@@ -515,6 +525,17 @@ class GCodeProcessor:
             # Clean up timestamped handler
             self.logger.removeHandler(file_handler)
             file_handler.close()
+
+            # Clean up temporary file if it still exists
+            if self.temp_path and os.path.exists(self.temp_path):
+                try:
+                    os.unlink(self.temp_path)
+                    self.logger.info(f"Cleaned up temporary file: {self.temp_path}")
+                except Exception as e:
+                    self.logger.error(
+                        f"Failed to clean up temporary file {self.temp_path}: {str(e)}"
+                    )
+            self.temp_path = None  # Reset tracking variable
 
         return input_path
 
