@@ -465,9 +465,13 @@ class GCodeProcessor:
         # Calculate shifts
         self.layer_parity = 1 if (layer_num % 2) == 0 else -1
         z_shift = self.layer_parity * self.layer_height * 0.5
-        xy_shift = round(
-            self.layer_parity * self.layer_height * self.lateral_shift_ratio, 5
-        )
+        # Cyclic XY shifts
+        cycle_index = layer_num % 4
+        x_dir, y_dir = [(1, 0), (0, 1), (-1, 0), (0, -1)][  # Right, Up, Left, Down
+            cycle_index
+        ]
+        xy_shift_x = round(x_dir * self.layer_height * self.lateral_shift_ratio, 5)
+        xy_shift_y = round(y_dir * self.layer_height * self.lateral_shift_ratio, 5)
 
         for line_idx, line in enumerate(layer_lines):
             original_line = line
@@ -491,27 +495,23 @@ class GCodeProcessor:
             ):
                 is_perimeter_line = True
 
-            # Apply and log XY shifts
-            if is_perimeter_line and ("X" in line or "Y" in line):
+            # Apply cyclic XY shifts
+            if is_perimeter_line and ("X" in line or "Y" in line) and not is_top_layer:
                 original_xy = line.strip()
-                # Apply X shift
                 line = re.sub(
-                    self.re_x, lambda m: f"X{float(m.group(1)) + xy_shift:.5f}", line
+                    self.re_x, lambda m: f"X{float(m.group(1)) + xy_shift_x:.5f}", line
                 )
-                # Apply Y shift
                 line = re.sub(
-                    self.re_y, lambda m: f"Y{float(m.group(1)) + xy_shift:.5f}", line
+                    self.re_y, lambda m: f"Y{float(m.group(1)) + xy_shift_y:.5f}", line
                 )
                 modified_xy = line.strip()
 
                 if modified_xy != original_xy:
-                    self.logger.debug("-" * 40)
                     self.logger.debug(
-                        f"XY-Shift Layer {layer_num+1} Parity {self.layer_parity}"
+                        f"Cycle {cycle_index} | X{xy_shift_x} Y{xy_shift_y}"
                     )
                     self.logger.debug(f"Original: {original_xy}")
                     self.logger.debug(f"Modified: {modified_xy}")
-                    self.logger.debug(f"Shift Values: X{xy_shift:.5f} Y{xy_shift:.5f}")
 
             # Extrusion adjustments
             if re.search(r"\bE[0-9]", line):
