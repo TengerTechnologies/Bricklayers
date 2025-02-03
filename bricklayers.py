@@ -117,6 +117,9 @@ class GCodeProcessor:
         self.layer_parity = 1  # Start with positive shift
         self.actual_z = 0.0  # Track printed Z
         self.current_z = 0.0  # 👈 Track actual printed Z
+        self.brick_height_layers = 3  # Layers per brick row
+        self.brick_z_shift = 0.1  # Vertical shift between brick rows
+        self.brick_phase = 0  # Track brick rows
 
         # Regex patterns
         self.re_z = re.compile(r"Z([\d.]+)")
@@ -457,26 +460,65 @@ class GCodeProcessor:
         processed = []
         z_shift_applied = False
 
-        # Geometric analysis with Shapely
-        perimeter_paths = self.parse_perimeter_paths(layer_lines)
-        outer_perimeters, inner_perimeters = self.classify_perimeters(perimeter_paths)
+        # Brick pattern initialization
+        prev_phase = self.brick_phase
+        self.brick_phase = (layer_num // self.brick_height_layers) % 2
+
+        if self.brick_phase != prev_phase:
+            self.logger.debug(f"New brick row started at layer {layer_num}")
+            perimeter_paths = {"outer": [], "inner": []}  # Initialize as dict
+        else:
+            outer, inner = self.classify_perimeters(
+                self.parse_perimeter_paths(layer_lines)
+            )
+            perimeter_paths = {"outer": outer, "inner": inner}
+
+        if not hasattr(self, "persistent_perimeters"):
+            self.persistent_perimeters = {"outer": [], "inner": []}
+
+        # Use more inclusive perimeter detection
         perimeter_lines = {
-            line for _, lines in outer_perimeters + inner_perimeters for line in lines
+            line
+            for _, lines in self.persistent_perimeters["outer"]
+            + self.persistent_perimeters["inner"]
+            for line in lines
         }
 
-        # Calculate shifts
-        self.layer_parity = 1 if (layer_num % 2) == 0 else -1
-        z_shift = self.layer_parity * self.layer_height * 0.5
-        # Cyclic XY shifts
-        cycle_index = layer_num % 4
-        x_dir, y_dir = [(1, 0), (0, 1), (-1, 0), (0, -1)][  # Right, Up, Left, Down
-            cycle_index
-        ]
-        xy_shift_x = round(x_dir * self.layer_height * self.lateral_shift_ratio, 5)
-        xy_shift_y = round(y_dir * self.layer_height * self.lateral_shift_ratio, 5)
+        # Overhang detection with improved markers
+        overhang_markers = {
+            "prusa": (";TYPE:Overhang perimeter", ";_BRIDGE_", ";BRIDGE"),
+            "bambu": (";FEATURE:Overhang", ";BRIDGE", ";_BRIDGE"),
+        }
+        current_printer_type = (
+            self.printer_type.value
+            if isinstance(self.printer_type, PrinterType)
+            else self.printer_type
+        )
+        has_overhangs = any(
+            any(marker in line for marker in overhang_markers[current_printer_type])
+            for line in layer_lines
+        )
 
+        # Calculate shifts
+        if self.brick_phase == 0:
+            z_shift = self.brick_z_shift
+            xy_shift = self.layer_height * self.lateral_shift_ratio
+        else:
+            z_shift = -self.brick_z_shift
+            xy_shift = -self.layer_height * self.lateral_shift_ratio
+
+        # Process each line
         for line_idx, line in enumerate(layer_lines):
             original_line = line
+            is_bridge = False
+            is_overhang = False
+
+            # Detect overhang/bridge lines
+            if any(marker in line for marker in overhang_markers[current_printer_type]):
+                if "BRIDGE" in line or "_BRIDGE" in line:
+                    is_bridge = True
+                else:
+                    is_overhang = True
 
             # Apply Z-shift
             if not z_shift_applied and line.startswith("G1 Z"):
@@ -484,44 +526,36 @@ class GCodeProcessor:
                     original_z = float(z_match.group(1))
                     new_z = original_z + z_shift
                     self.current_z = new_z
-                    modified_z_line = f"G1 Z{new_z:.3f} F{self.z_speed} ; SHIFT_APPLIED {z_shift:+.3f}mm\n"
-                    self.logger.debug(f"Z-Shift Original: {line.strip()}")
-                    self.logger.debug(f"Z-Shift Modified: {modified_z_line.strip()}")
-                    line = modified_z_line
+                    line = f"G1 Z{new_z:.3f} F{self.z_speed} ; brick_shift {z_shift:+.3f}mm\n"
                     z_shift_applied = True
 
-            # Hybrid detection: Geometric + slicer markers
-            is_perimeter_line = line_idx in perimeter_lines
-            if any(
-                line.strip().startswith(marker) for marker in [";TYPE:", "; FEATURE:"]
-            ):
-                is_perimeter_line = True
+            # Apply XY shifts with enhanced overhang handling
+            current_shift = xy_shift
+            if is_overhang:
+                current_shift *= (
+                    0.2  # Reduce to 20% of normal shift (0.01mm @ 0.2mm layers)
+                )
+                self.logger.debug(f"Overhang shift reduction: {current_shift:.3f}mm")
+            elif is_bridge:
+                current_shift = 0
+                self.logger.debug("Bridge detected - zero shift")
 
-            # Apply cyclic XY shifts
-            if is_perimeter_line and ("X" in line or "Y" in line):
-                original_xy = line.strip()
+            if line_idx in perimeter_lines and ("X" in line or "Y" in line):
+                # Apply shifts
                 line = re.sub(
-                    self.re_x, lambda m: f"X{float(m.group(1)) + xy_shift_x:.5f}", line
+                    self.re_x,
+                    lambda m: f"X{float(m.group(1)) + current_shift:.5f}",
+                    line,
                 )
                 line = re.sub(
-                    self.re_y, lambda m: f"Y{float(m.group(1)) + xy_shift_y:.5f}", line
+                    self.re_y,
+                    lambda m: f"Y{float(m.group(1)) + current_shift:.5f}",
+                    line,
                 )
-                modified_xy = line.strip()
-
-                if modified_xy != original_xy:
-                    self.logger.debug(
-                        f"Cycle {cycle_index} | X{xy_shift_x} Y{xy_shift_y}"
-                    )
-                    self.logger.debug(f"Original: {original_xy}")
-                    self.logger.debug(f"Modified: {modified_xy}")
 
             # Extrusion adjustments
             if re.search(r"\bE[0-9]", line):
-                original_e = line.strip()
                 line = self._adjust_extrusion(line, layer_num == total_layers - 1)
-                if line.strip() != original_e:
-                    self.logger.debug(f"E-Adjust Original: {original_e}")
-                    self.logger.debug(f"E-Adjust Modified: {line.strip()}")
                 self.total_extrusion_adjustments += 1
 
             processed.append(line)
@@ -529,9 +563,9 @@ class GCodeProcessor:
         # Logging
         self.layer_times.append((datetime.now() - layer_start).total_seconds())
         self.logger.info(
-            f"Layer {layer_num+1}: Z={self.current_z:.3f} | "
-            f"Shift={z_shift:.3f}mm | X-Offset={xy_shift_x:.3f}mm | Y-Offset={xy_shift_y:.3f}mm |"
-            f"Paths={len(perimeter_paths)}"
+            f"Brick Row {self.brick_phase} | Layer {layer_num+1}: "
+            f"Z={self.current_z:.3f} | XY-Shift={xy_shift:.3f}mm | "
+            f"Overhangs={has_overhangs} | Paths={len(self.persistent_perimeters['outer']) + len(self.persistent_perimeters['inner'])}"
         )
 
         return processed
