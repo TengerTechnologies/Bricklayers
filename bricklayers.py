@@ -449,7 +449,7 @@ class GCodeProcessor:
 
         processed = []
         current_z = None
-        shift_amount = self.layer_height * 0.5
+        shift_amount = self.layer_height * 0.25
 
         for line in layer_lines:
             original_line = line
@@ -530,7 +530,7 @@ class GCodeProcessor:
             self.layer_height = self.layer_height or self.detect_layer_height(
                 input_path
             )
-            self.z_shift = self.layer_height * 0.5
+            self.z_shift = self.layer_height * 0.25
             self.z_speed = self.z_speed or self.detect_z_speed(input_path)
 
             with open(input_path, "r+") as f:
