@@ -15,7 +15,8 @@
 
 from datetime import datetime
 import mmap
-from shapely.geometry import Polygon
+import math
+from shapely.geometry import Polygon, MultiPolygon, LineString
 from shapely.strtree import STRtree
 from shapely.validation import make_valid
 import logging
@@ -30,9 +31,8 @@ import logging.handlers
 
 
 class PrinterType(Enum):
-
-    BAMBU = "bambu"  # Bambu Lab Studio slicer identification
-    PRUSA = "prusa"  # PrusaSlicer/G-code dialect identification
+    BAMBU = "bambu"
+    PRUSA = "prusa"
 
 
 class PerimeterType(Enum):
@@ -51,14 +51,18 @@ class GCodeProcessor:
         min_distance=0.1,
         max_intersection_area=0.5,
         simplify_tolerance=0.03,
-        log_level=logging.INFO,
         z_speed=None,
-        max_area_deviation=0.02,
-        hausdorff_multiplier=0.15,
-        max_z_speed=300.0,
+        log_level=logging.INFO,
+        max_area_deviation=0.06,  # More conservative default
+        hausdorff_multiplier=0.3,  # Balanced default
+        max_z_speed=6000.0,
         min_z_move_time=0.5,
         safe_z_distance=1.0,
-        min_perimeter_points=4,
+        min_perimeter_points=3,
+        full_layer_shifts=True,
+        min_feature_size=0.2,  # More practical default
+        critical_angle=25,
+        precision_mode="auto",
     ):
         self.extrusion_multiplier = extrusion_multiplier
         self.first_layer_multiplier = (
@@ -82,13 +86,10 @@ class GCodeProcessor:
         self.z_shift = None
         self.shifted_blocks = 0
         self.z_speed = z_speed
-        self.perimeter_found = False
-        self.total_z_shifts = 0
         self.total_extrusion_adjustments = 0
         self.processing_start = None
         self.layer_times = []
         self.simplified_features = 0
-        self.simplify_success_count = 0
         self.failed_simplifications = 0
         self.decoding_errors = 0
         self.max_area_deviation = max_area_deviation
@@ -97,8 +98,18 @@ class GCodeProcessor:
         self.min_z_move_time = min_z_move_time
         self.safe_z_distance = safe_z_distance
         self.min_perimeter_points = min_perimeter_points
+        self.full_layer_shifts = full_layer_shifts
+        self.layer_shift_pattern = []
+        self.min_feature_size = min_feature_size
+        self.critical_angle = critical_angle
+        self.precision_mode = precision_mode
+        self.skipped_small_features = 0
+        self.closure_tolerance = 0.001
+        self.travel_threshold = 0.2  # mm
+        self.closed_paths = 0
+        self.open_paths = 0
 
-        # Precompile regex patterns
+        # Regex patterns
         self.re_z = re.compile(r"Z([\d.]+)")
         self.re_f = re.compile(r"F([\d.]+)")
         self.re_e = re.compile(r"E([\d.]+)")
@@ -108,10 +119,16 @@ class GCodeProcessor:
 
         self._configure_logging(log_level)
 
+    def is_path_closed(self, path):
+        if len(path) < 2:
+            return False
+        dx = abs(path[0][0] - path[-1][0])
+        dy = abs(path[0][1] - path[-1][1])
+        return dx < self.closure_tolerance and dy < self.closure_tolerance
+
     def _calculate_z_speed(self, delta_z):
-        """Calculate safe Z speed based on movement distance and safety parameters"""
         if delta_z <= self.safe_z_distance:
-            required_speed = (delta_z / self.min_z_move_time) * 60  # Convert to mm/min
+            required_speed = (delta_z / self.min_z_move_time) * 60
             return min(self.max_z_speed, required_speed)
         return self.max_z_speed
 
@@ -120,10 +137,14 @@ class GCodeProcessor:
             return line_bytes.decode("utf-8")
         except UnicodeDecodeError as e:
             self.decoding_errors += 1
-            self.logger.warning(
-                f"Encoding error in line (replaced invalid bytes): {str(e)}"
-            )
+            self.logger.warning(f"Encoding error: {str(e)}")
             return line_bytes.decode("utf-8", errors="replace")
+
+    def _is_travel_move(self, path):
+        """Detect short moves that aren't real perimeters"""
+        if len(path) < 2:
+            return True
+        return LineString(path).length < self.travel_threshold
 
     def _configure_logging(self, log_level):
         self.logger = logging.getLogger("Bricklayers")
@@ -133,8 +154,6 @@ class GCodeProcessor:
             formatter = logging.Formatter(
                 "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
             )
-
-            # Rotating main log (keep latest runs)
             rotating_handler = logging.handlers.RotatingFileHandler(
                 "bricklayers.log",
                 maxBytes=10 * 1024 * 1024,
@@ -142,12 +161,9 @@ class GCodeProcessor:
                 encoding="utf-8",
             )
             rotating_handler.setFormatter(formatter)
-
-            # Error console output
             console_handler = logging.StreamHandler()
             console_handler.setLevel(logging.ERROR)
             console_handler.setFormatter(formatter)
-
             self.logger.addHandler(rotating_handler)
             self.logger.addHandler(console_handler)
 
@@ -155,7 +171,7 @@ class GCodeProcessor:
         with open(file_path, "r") as f:
             with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
                 for line in iter(mm.readline, b""):
-                    decoded_line = decoded_line = self.decode_line(line)
+                    decoded_line = self.decode_line(line)
                     if "; FEATURE:" in decoded_line:
                         return PrinterType.BAMBU.value
                     if ";TYPE:" in decoded_line:
@@ -167,46 +183,22 @@ class GCodeProcessor:
         with open(file_path, "r") as f:
             with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
                 for line in iter(mm.readline, b""):
-                    decoded_line = decoded_line = self.decode_line(line)
-                    if decoded_line.startswith("G1 Z"):
+                    decoded_line = self.decode_line(line)
+                    if re.match(r"^G[01] Z\d", decoded_line.strip()):
                         z_match = self.re_z.search(decoded_line)
                         if z_match:
                             z_values.append(float(z_match.group(1)))
 
-        # Calculate all positive layer height candidates
-        layer_heights = []
-        for i in range(len(z_values) - 1):
-            delta = z_values[i + 1] - z_values[i]
-            if delta > 0:  # Only consider positive Z movements
-                layer_heights.append(delta)
-
-        # Validation checks
-        if not layer_heights:
-            raise ValueError("No valid positive Z-axis movements detected")
-
-        if len(set(round(h, 3) for h in layer_heights)) > 3:
-            self.logger.warning("Multiple different layer heights detected")
-
-        median_height = median(layer_heights)
-
-        # Sanity bounds check (0.04mm - 0.6mm)
-        if not 0.04 <= median_height <= 0.6:
-            raise ValueError(
-                f"Implausible layer height: {median_height:.2f}mm. "
-                "Check Z-axis movements or specify manually with -layerHeight"
-            )
-
-        # Verify reasonable distribution around median
-        within_tolerance = [
-            h
-            for h in layer_heights
-            if 0.95 * median_height <= h <= 1.05 * median_height
+        layer_heights = [
+            z_values[i + 1] - z_values[i]
+            for i in range(len(z_values) - 1)
+            if z_values[i + 1] > z_values[i]
         ]
-        if len(within_tolerance) / len(layer_heights) < 0.8:
-            self.logger.warning(
-                "Inconsistent layer heights detected - verify Z-axis commands"
-            )
-
+        if not layer_heights:
+            raise ValueError("No positive Z moves detected")
+        median_height = median(layer_heights)
+        if not 0.04 <= median_height <= 0.6:
+            raise ValueError(f"Implausible layer height: {median_height:.2f}mm")
         return median_height
 
     def detect_z_speed(self, file_path):
@@ -214,66 +206,11 @@ class GCodeProcessor:
         with open(file_path, "r") as f:
             for line in f:
                 line = line.strip()
-                if line.startswith(("G0 ", "G1 ")):
-                    # Check for Z moves without X/Y
-                    if "Z" in line and "X" not in line and "Y" not in line:
-                        f_match = self.re_f.search(line)
-                        if f_match:
-                            try:
-                                speed = float(f_match.group(1))
-                                z_speeds.append(speed)
-                                self.logger.debug(f"Found Z move with F{speed}")
-                            except ValueError:
-                                pass
-
-        if z_speeds:
-            detected_speed = median(z_speeds)
-            self.logger.info(
-                f"Detected Z-axis speed: {detected_speed} mm/min (from {len(z_speeds)} samples)"
-            )
-            return detected_speed
-        else:
-            default_speed = 300.0  # 300 mm/min = 5 mm/s
-            self.logger.warning(
-                f"No Z-axis speeds detected, using default {default_speed} mm/min"
-            )
-            return default_speed
-
-    def dynamic_simplification_tolerance(self, poly: Polygon) -> float:
-        bounds = poly.bounds
-        width = bounds[2] - bounds[0]
-        height = bounds[3] - bounds[1]
-
-        # Handle degenerate geometries with zero/negative dimensions
-        if width <= 0.0 or height <= 0.0:
-            return self.simplify_tolerance
-
-        min_dimension = min(width, height)
-        return max(self.simplify_tolerance, min_dimension * 0.1)
-
-    def validate_simplification(self, original: Polygon, simplified: Polygon) -> bool:
-        if not simplified.is_valid:
-            return False
-
-        min_dimension = min(
-            original.bounds[2] - original.bounds[0],
-            original.bounds[3] - original.bounds[1],
-        )
-
-        return (
-            # Use configured area deviation
-            (
-                abs(original.area - simplified.area) / original.area
-                < self.max_area_deviation
-            )
-            and
-            # Scale Hausdorff threshold with both feature size and configuration
-            (
-                original.hausdorff_distance(simplified)
-                < min_dimension * self.hausdorff_multiplier
-            )
-            and (len(simplified.exterior.coords) >= 4)
-        )
+                if line.startswith(("G0 ", "G1 ")) and "Z" in line:
+                    f_match = self.re_f.search(line)
+                    if f_match:
+                        z_speeds.append(float(f_match.group(1)))
+        return median(z_speeds) if z_speeds else 6000.0
 
     def parse_perimeter_paths(self, layer_lines):
         perimeter_paths = []
@@ -282,22 +219,32 @@ class GCodeProcessor:
         current_lines = []
 
         for line_idx, line in enumerate(layer_lines):
-            # First try slicer-specific classification
+            # Handle layer change markers first
+            if any(marker in line for marker in [";LAYER:", "; CHANGE_LAYER"]):
+                if current_path:
+                    self.logger.debug(
+                        f"Clearing buffer at layer change (line {line_idx}): {len(current_path)} points"
+                    )
+                    current_path = []
+                    current_lines = []
+                continue
+
+            # Printer-specific type detection
             if self.printer_type == PrinterType.BAMBU.value:
                 if "; FEATURE" in line:
-                    if "Inner wall" in line:
-                        current_type = PerimeterType.INNER
-                    elif "Outer wall" in line:
-                        current_type = PerimeterType.OUTER
+                    current_type = (
+                        PerimeterType.INNER if "Inner" in line else PerimeterType.OUTER
+                    )
             elif self.printer_type == PrinterType.PRUSA.value:
-                if ";TYPE" in line:
-                    if "WALL-OUTER" in line:
-                        current_type = PerimeterType.OUTER
-                    elif "WALL-INNER" in line:
-                        current_type = PerimeterType.INNER
+                if ";TYPE:" in line:
+                    current_type = (
+                        PerimeterType.OUTER
+                        if "External perimeter" in line
+                        else PerimeterType.INNER
+                    )
 
-            # Path parsing logic (existing code)
-            if line.startswith("G1") and "X" in line and "Y" in line and "E" in line:
+            # Path collection logic
+            if line.startswith("G1") and "X" in line and "Y" in line:
                 x_match = self.re_x.search(line)
                 y_match = self.re_y.search(line)
                 if x_match and y_match:
@@ -307,56 +254,245 @@ class GCodeProcessor:
                     current_lines.append(line_idx)
             else:
                 if current_path:
-                    # Enhanced geometry validation
                     try:
-                        # Close the path if needed
-                        if current_path[0] != current_path[-1]:
-                            current_path.append(current_path[0])
-
-                        # Validate minimum point count
-                        if len(current_path) < self.min_perimeter_points:
-                            raise ValueError(
-                                f"Insufficient points ({len(current_path)})"
+                        # Early rejection of invalid paths
+                        if len(current_path) < 2:
+                            self.logger.debug(
+                                f"Skipping micro-path at line {line_idx} (only {len(current_path)} points)"
                             )
+                            current_path = []
+                            continue
 
-                        # Create and validate polygon
+                        # Filter travel moves
+                        if self._is_travel_move(current_path):
+                            self.logger.debug(
+                                f"Ignoring travel move at line {line_idx}"
+                            )
+                            current_path = []
+                            continue
+
+                        # Closure handling
+                        is_closed = self.is_path_closed(current_path)
+                        if is_closed:
+                            self.closed_paths += 1
+                            if len(current_path) > 3:
+                                current_path = current_path[
+                                    :-1
+                                ]  # Remove duplicate closure
+                        else:
+                            self.open_paths += 1
+                            current_path.append(current_path[0])  # Force closure
+
+                        # Post-closure validation
+                        if len(current_path) < 3:
+                            self.logger.debug(
+                                f"Rejecting path at line {line_idx} - insufficient points after closure"
+                            )
+                            current_path = []
+                            continue
+
+                        # Geometry processing
                         poly = make_valid(Polygon(current_path))
-                        if not isinstance(poly, Polygon):
-                            raise ValueError(
-                                f"Resulting geometry is {poly.geom_type}, expected Polygon"
-                            )
-                        if not poly.is_valid:
-                            raise ValueError("Invalid geometry after make_valid")
-                        if poly.area <= 0.0:
-                            raise ValueError(
-                                f"Polygon has non-positive area: {poly.area}"
-                            )
+                        if isinstance(poly, LineString):
+                            poly = poly.buffer(0.15)
+                        elif isinstance(poly, MultiPolygon):
+                            poly = max(poly.geoms, key=lambda p: p.area)
 
-                        # Store with classification
-                        perimeter_paths.append(
-                            (
-                                poly,
-                                current_lines,
-                                current_type if current_type else None,
-                            )
-                        )
+                        # Precision processing
+                        original_area = poly.area
+                        min_feature_area = (self.min_feature_size**2) * 4
+                        if original_area > 0 and self.precision_mode != "disabled":
+                            if self.precision_mode == "auto":
+                                # Auto-detect high precision needs
+                                if (
+                                    self.layer_height < 0.1
+                                    or self.min_feature_size < 0.2
+                                ):
+                                    precision_class = "high_precision"
+                                    self.logger.debug(
+                                        "Auto-detected high precision requirements"
+                                    )
+                                else:
+                                    precision_class = "balanced"
+                            else:
+                                precision_class = self.precision_mode
+
+                            # Layer-height adaptive parameters
+                            if self.layer_height < 0.15:
+                                self.hausdorff_multiplier *= 0.8
+                                self.max_area_deviation *= 1.2
+
+                            precision_params = {
+                                "high_precision": {"hausdorff": 0.1, "max_dev": 0.015},
+                                "balanced": {"hausdorff": 0.2, "max_dev": 0.06},
+                                "draft": {"hausdorff": 0.3, "max_dev": 0.04},
+                            }[precision_class]
+
+                            if original_area > min_feature_area:
+                                dynamic_tolerance = max(
+                                    math.sqrt(original_area)
+                                    * self.hausdorff_multiplier,
+                                    self.simplify_tolerance,
+                                )
+                                # Add layer-based adaptation
+                                dynamic_tolerance *= (
+                                    1 + self.current_layer / self.total_layers
+                                )
+
+                                simplified = poly.simplify(
+                                    dynamic_tolerance, preserve_topology=True
+                                )
+                                area_deviation = (
+                                    abs(simplified.area - original_area) / original_area
+                                )
+
+                                if area_deviation <= precision_params["max_dev"]:
+                                    poly = simplified
+                                    self.simplified_features += 1
+                                else:
+                                    self.failed_simplifications += 1
+                            else:
+                                self.skipped_small_features += 1
+
+                        perimeter_paths.append((poly, current_lines, current_type))
 
                     except Exception as e:
                         self.failed_simplifications += 1
-                        self.logger.warning(
-                            f"Skipping invalid path at line {line_idx}: {str(e)}"
+                        self.logger.debug(
+                            f"Path processing failed at line {line_idx}: {str(e)}"
                         )
+                    finally:
+                        current_path = []
+                        current_lines = []
+                        current_type = None
 
-                    current_path = []
-                    current_lines = []
-                    current_type = None
+        # Handle any remaining path in buffer
+        if current_path:
+            self.logger.warning(
+                f"Unprocessed path remaining at layer end: {len(current_path)} points"
+            )
 
         return perimeter_paths
+
+    def get_memory_usage(self):
+        try:
+            import psutil
+
+            process = psutil.Process(os.getpid())
+            return process.memory_info().rss / (1024 * 1024)
+        except ImportError:
+            try:
+                import resource
+
+                return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+            except:
+                return 0.0
+
+    def classify_perimeters(self, perimeter_paths):
+        classified = {"outer": [], "inner": []}
+        unclassified = []
+
+        for poly, lines, ptype in perimeter_paths:
+            if ptype == PerimeterType.OUTER:
+                classified["outer"].append((poly, lines))
+            elif ptype == PerimeterType.INNER:
+                classified["inner"].append((poly, lines))
+            else:
+                unclassified.append((poly, lines))
+
+        if unclassified and (classified["outer"] or classified["inner"]):
+            outer_polys = [p for p, _ in classified["outer"]]
+            tree = STRtree(outer_polys) if outer_polys else None
+
+            for poly, lines in unclassified:
+                is_inner = False
+                if tree:
+                    candidate_indices = tree.query(poly)
+                    candidates = [outer_polys[i] for i in candidate_indices]
+
+                    containing_outers = [
+                        op for op in candidates if op.contains(poly.buffer(-0.01))
+                    ]
+
+                    if containing_outers:
+                        parent_outer = max(
+                            containing_outers, key=lambda op: op.intersection(poly).area
+                        )
+                        area_ratio = poly.area / parent_outer.area
+                        if area_ratio < 0.75:
+                            intersection = parent_outer.intersection(poly).area
+                            if intersection / poly.area >= 0.95:
+                                is_inner = True
+                    else:
+                        nearest_idx = tree.nearest(poly)
+                        nearest = outer_polys[nearest_idx]
+                        distance = poly.distance(nearest)
+                        if distance < self.min_distance * 0.5:
+                            if poly.area / nearest.area < 0.25:
+                                is_inner = True
+
+                classified["inner" if is_inner else "outer"].append((poly, lines))
+
+        return classified["outer"], classified["inner"]
+
+    def process_layer(self, layer_lines, layer_num, total_layers):
+        layer_start = datetime.now()
+        perimeter_paths = self.parse_perimeter_paths(layer_lines)
+        outer, inner = self.classify_perimeters(perimeter_paths)
+
+        shift_layer = len(inner) > 0
+        if shift_layer:
+            self.layer_shift_pattern.append(1)
+            self.shifted_blocks += 1
+        else:
+            self.layer_shift_pattern.append(0)
+
+        processed = []
+        current_z = None
+        shift_amount = self.layer_height * 0.5
+
+        for line in layer_lines:
+            original_line = line
+
+            if self.full_layer_shifts and line.startswith("G1 Z"):
+                z_match = self.re_z.search(line)
+                if z_match:
+                    current_z = float(z_match.group(1))
+                    if shift_layer:
+                        new_z = current_z + shift_amount
+                        line = f"G1 Z{new_z:.3f} F{self.z_speed}\n"
+                        processed.append(line)
+                        continue
+
+            if "E" in line and (shift_layer or not self.full_layer_shifts):
+                line = self._adjust_extrusion(line, layer_num == total_layers - 1)
+
+            processed.append(line)
+
+        self.layer_times.append((datetime.now() - layer_start).total_seconds())
+        shift_reason = (
+            "Shift applied: Found {0} inner perimeters".format(len(inner))
+            if shift_layer
+            else "No shift: No inner perimeters detected"
+        )
+        self.logger.info(
+            f"Layer {layer_num+1}: {shift_reason} | "
+            f"Processing mode: {self._get_current_precision_mode()}"
+        )
+        return processed
+
+    def _get_current_precision_mode(self):
+        if self.precision_mode == "auto":
+            return (
+                "auto-detected high precision"
+                if (self.layer_height < 0.1 or self.min_feature_size < 0.2)
+                else "auto-detected standard"
+            )
+        return self.precision_mode
 
     def _adjust_extrusion(self, line, is_last_layer):
         e_match = self.re_e.search(line)
         if e_match:
-            self.total_extrusion_adjustments += 1
             e_value = float(e_match.group(1))
             if self.current_layer == 0:
                 new_e = e_value * self.first_layer_multiplier
@@ -366,355 +502,98 @@ class GCodeProcessor:
                 comment = "last layer"
             else:
                 new_e = e_value * self.extrusion_multiplier
-                comment = "internal perimeter"
-            adjusted = self.re_e_sub.sub(f"E{new_e:.5f}", line).strip()
-            return f"{adjusted} ; {comment}\n"
+                comment = "adjusted extrusion"
+            self.total_extrusion_adjustments += 1
+            return self.re_e_sub.sub(f"E{new_e:.5f}", line).rstrip() + f" ; {comment}\n"
         return line
-
-    def classify_perimeters(self, perimeter_paths):
-        """Classify perimeters using slicer comments when available, falling back to spatial analysis."""
-        classified = {"outer": [], "inner": []}
-        unclassified = []
-
-        # First pass: Process comment-classified perimeters
-        for path in perimeter_paths:
-            poly, lines, ptype = path
-            if ptype:
-                if ptype == PerimeterType.OUTER:
-                    classified["outer"].append((poly, lines))
-                    self.logger.debug(
-                        f"Comment-classified outer perimeter with {len(lines)} commands"
-                    )
-                elif ptype == PerimeterType.INNER:
-                    classified["inner"].append((poly, lines))
-                    self.logger.debug(
-                        f"Comment-classified inner perimeter with {len(lines)} commands"
-                    )
-            else:
-                unclassified.append((poly, lines))
-
-        # Second pass: Spatial analysis for unclassified
-        if unclassified:
-            self.logger.info(
-                f"Performing spatial analysis on {len(unclassified)} unclassified perimeters"
-            )
-            polygons, line_indices = zip(*unclassified)
-            tree = STRtree(polygons)
-
-            for idx, (poly, lines) in enumerate(unclassified):
-                is_inner = False
-                candidates = tree.query(poly)
-
-                for candidate_idx in candidates:
-                    if candidate_idx == idx:
-                        continue  # Skip self-comparison
-
-                    candidate = polygons[candidate_idx]
-                    if candidate.area > poly.area:
-                        # Containment check
-                        if candidate.contains(poly):
-                            is_inner = True
-                            break
-
-                        # Overlap threshold check
-                        intersection = candidate.intersection(poly)
-                        if not intersection.is_empty:
-                            overlap_ratio = intersection.area / poly.area
-                            if overlap_ratio > self.max_intersection_area:
-                                is_inner = True
-                                break
-
-                if is_inner:
-                    classified["inner"].append((poly, lines))
-                    self.logger.debug(
-                        f"Spatial-classified inner perimeter (Area: {poly.area:.2f}mm²)"
-                    )
-                else:
-                    classified["outer"].append((poly, lines))
-                    self.logger.debug(
-                        f"Spatial-classified outer perimeter (Area: {poly.area:.2f}mm²)"
-                    )
-
-        # Validation checks
-        self._validate_classification(classified)
-
-        return classified["outer"], classified["inner"]
-
-    def _validate_classification(self, classified):
-        """Perform sanity checks on classification results."""
-        total_perimeters = len(classified["outer"]) + len(classified["inner"])
-
-        # Check for empty layers
-        if total_perimeters == 0:
-            self.logger.warning("No perimeters found in layer")
-            return
-
-        # Modified area validation with relative comparison
-        outer_areas = [p.area for p, _ in classified["outer"]]
-        inner_areas = [p.area for p, _ in classified["inner"]]
-
-        if outer_areas and inner_areas:
-            for i, inner_area in enumerate(inner_areas):
-                closest_outer = min(outer_areas, key=lambda x: abs(x - inner_area))
-                if inner_area > closest_outer * 1.1:  # Allow 10% tolerance
-                    self.logger.warning(
-                        f"Potential classification issue: Inner perimeter {i} "
-                        f"({inner_area:.2f}mm²) larger than nearest outer ({closest_outer:.2f}mm²)"
-                    )
-
-        # Modified containment check with spatial index
-        if classified["outer"] and classified["inner"]:
-            outer_polys = [p for p, _ in classified["outer"]]
-            tree = STRtree(outer_polys)
-
-            for inner_poly, _ in classified["inner"]:
-                # Find nearest outer polygon instead of checking all
-                nearest_outer_idx = tree.nearest(inner_poly)
-                nearest_outer = outer_polys[nearest_outer_idx]
-
-                if not nearest_outer.contains(inner_poly):
-                    self.logger.debug(
-                        "Outer perimeter doesn't contain nearest inner - "
-                        f"this might be normal for complex geometries "
-                        f"(outer area: {nearest_outer.area:.2f}mm², "
-                        f"inner area: {inner_poly.area:.2f}mm²)"
-                    )
-
-    def process_layer(self, layer_lines, layer_num, total_layers):
-        layer_start = datetime.now()
-        perimeter_paths = self.parse_perimeter_paths(layer_lines)
-        outer_perimeters, inner_perimeters = self.classify_perimeters(perimeter_paths)
-
-        internal_lines = set()
-        for _, line_indices in inner_perimeters:
-            internal_lines.update(line_indices)
-
-        processed = []
-        current_block = 0
-        in_internal = False
-        current_f = None
-        original_f = None
-
-        # Initial feedrate detection
-        for line in layer_lines:
-            if f_match := self.re_f.search(line):
-                current_f = float(f_match.group(1))
-                break
-
-        for line_idx, line in enumerate(layer_lines):
-            if f_match := self.re_f.search(line):
-                current_f = float(f_match.group(1))
-
-            if line.startswith("G1 Z"):
-                if z_match := self.re_z.search(line):
-                    self.current_z = float(z_match.group(1))
-
-            if line_idx in internal_lines:
-                if not in_internal:
-                    # Start of internal perimeter block
-                    current_block += 1
-                    original_f = current_f
-                    z_shift = self.layer_height * 0.5 if current_block % 2 else 0
-                    delta_z = abs(z_shift)
-
-                    # Calculate dynamic speed for upward move
-                    dynamic_up_speed = self._calculate_z_speed(delta_z)
-                    processed.append(
-                        f"G1 Z{self.current_z + z_shift:.3f} F{dynamic_up_speed} ; Z-shift block {current_block}\n"
-                    )
-
-                    if original_f is not None:
-                        processed.append(f"G1 F{original_f:.1f} ; Restore feedrate\n")
-                    else:
-                        self.logger.warning(
-                            f"No feedrate captured before Z-shift at layer {layer_num}"
-                        )
-
-                    in_internal = True
-                    self.shifted_blocks += 1
-
-                processed.append(
-                    self._adjust_extrusion(line, layer_num == total_layers - 1)
-                )
-            else:
-                if in_internal:
-                    # Calculate dynamic speed for downward reset
-                    z_shift = self.layer_height * 0.5 if (current_block % 2) else 0
-                    delta_z = abs(z_shift)
-                    dynamic_down_speed = self._calculate_z_speed(delta_z)
-
-                    processed.append(
-                        f"G1 Z{self.current_z:.3f} F{dynamic_down_speed} ; Reset Z position\n"
-                    )
-
-                    if current_f is not None:
-                        processed.append(
-                            f"G1 F{current_f:.1f} ; Resume outer feedrate\n"
-                        )
-
-                    in_internal = False
-                processed.append(line)
-
-        self.layer_times.append((datetime.now() - layer_start).total_seconds())
-        self.logger.info(
-            f"Layer {layer_num+1}: Shifted {current_block} blocks | "
-            f"Feedrate preservation: {original_f or 'default'}"
-        )
-        return processed
 
     def process_gcode(self, input_file, is_bgcode=False):
         self.processing_start = datetime.now()
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        self.temp_path = None  # Track temporary file path at instance level
-
-        # Generate timestamped log filename
-        current_time = datetime.now().astimezone().strftime("%Y-%m-%d_%H-%M-%S_GMT%z")
-        timestamped_log = os.path.join(script_dir, f"bricklayers_{current_time}.log")
-
-        # Create timestamped log handler
-        file_handler = logging.FileHandler(timestamped_log, encoding="utf-8")
-        file_handler.setFormatter(
-            logging.Formatter(
-                "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
-            )
+        current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        log_handler = logging.FileHandler(
+            os.path.join(script_dir, f"bricklayers_{current_time}.log"),
+            encoding="utf-8",
         )
-        self.logger.addHandler(file_handler)
+        log_handler.setFormatter(
+            logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+        )
+        self.logger.addHandler(log_handler)
 
         try:
-            self.logger.info("═" * 55)
-            self.logger.info(f"Starting processing of {input_file}")
-            self.logger.info(f"Timestamped log: {timestamped_log}")
-
             input_path = Path(input_file)
             if is_bgcode:
                 input_path = input_path.with_suffix(".gcode")
-                self.logger.info(f"Decoding binary G-code to: {input_path}")
                 os.system(f"bgcode decode {input_file} -o {input_path}")
 
-            # Printer detection and layer height calculation
-            self.logger.info("Detecting printer type...")
             self.printer_type = self.detect_printer_type(input_path)
-
-            if self.layer_height is None:
-                self.logger.info("Auto-detecting layer height...")
-                self.layer_height = self.detect_layer_height(input_path)
-
-            self.z_shift = self.layer_height * 0.5
-
-            if self.z_speed is None:
-                self.z_speed = self.detect_z_speed(input_path)
-            self.logger.info(f"Z-axis move speed: {self.z_speed} mm/min")
-
-            self.logger.info(
-                f"Layer height: {self.layer_height:.2f}mm | Z-shift: {self.z_shift:.2f}mm"
+            self.layer_height = self.layer_height or self.detect_layer_height(
+                input_path
             )
+            self.z_shift = self.layer_height * 0.5
+            self.z_speed = self.z_speed or self.detect_z_speed(input_path)
 
-            # Streaming layer processing
-            with open(input_path, "r") as f:
+            with open(input_path, "r+") as f:
                 with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                    self.logger.info("Counting total layers...")
                     self.total_layers = sum(
-                        1 for line in iter(mm.readline, b"") if line.startswith(b"G1 Z")
+                        1 for line in iter(mm.readline, b"") if b"G1 Z" in line
                     )
                     mm.seek(0)
-                    self.logger.info(f"Found {self.total_layers} layers to process")
 
-                    with NamedTemporaryFile(mode="w", delete=False) as temp_file:
-                        self.temp_path = temp_file.name  # Capture path immediately
+                    with NamedTemporaryFile(mode="w", delete=False) as tmp_file:
                         layer_buffer = []
                         current_layer = 0
 
-                        self.logger.info("Begin layer processing...")
-                        try:
-                            for line in iter(mm.readline, b""):
-                                decoded_line = decoded_line = self.decode_line(line)
-                                layer_buffer.append(decoded_line)
+                        for line in iter(mm.readline, b""):
+                            decoded_line = self.decode_line(line)
+                            layer_buffer.append(decoded_line)
 
-                                if (
-                                    decoded_line.startswith("G1 Z")
-                                    or "; CHANGE_LAYER" in decoded_line
-                                ):
-                                    if layer_buffer:
-                                        processed = self.process_layer(
-                                            layer_buffer,
-                                            current_layer,
-                                            self.total_layers,
-                                        )
-                                        temp_file.writelines(processed)
-                                        current_layer += 1
-                                        layer_buffer = []
-
-                            if layer_buffer:
+                            if (
+                                "G1 Z" in decoded_line
+                                or "; CHANGE_LAYER" in decoded_line
+                            ):
                                 processed = self.process_layer(
                                     layer_buffer, current_layer, self.total_layers
                                 )
-                                temp_file.writelines(processed)
-                        except Exception as e:
-                            self.logger.error(
-                                f"Critical error during processing: {str(e)}"
+                                tmp_file.writelines(processed)
+                                current_layer += 1
+                                layer_buffer = []
+
+                        if layer_buffer:
+                            processed = self.process_layer(
+                                layer_buffer, current_layer, self.total_layers
                             )
-                            raise  # Re-raise to trigger finally cleanup
+                            tmp_file.writelines(processed)
 
-                    # Only reach here if processing completed successfully
-                    os.replace(self.temp_path, input_path)
-                    self.temp_path = None  # Successfully replaced, clear cleanup flag
-                    self.logger.info(f"Processed file saved to: {input_path}")
+                        os.replace(tmp_file.name, input_path)
 
-            if is_bgcode:
-                self.logger.info("Re-encoding to binary G-code format...")
-                os.system(f"bgcode encode {input_path}")
-                input_path.unlink()
-
-            # Final report
-            self.logger.info(
+            final_report = (
                 "════════════════════ Processing Complete ════════════════════\n"
-                f"Total Layers Processed: {self.total_layers}\n"
+                f"Total Layers: {self.total_layers} | Shifted Layers: {sum(self.layer_shift_pattern)}\n"
                 f"Total Decoding Errors: {self.decoding_errors}\n"
                 f"Total Z-Shifts Applied: {self.shifted_blocks}\n"
                 f"Extrusion Adjustments: {self.total_extrusion_adjustments}\n"
                 f"Simplified Features: {self.simplified_features}\n"
+                f"Skipped Small Features: {self.skipped_small_features}\n"
                 f"Failed Simplifications: {self.failed_simplifications}\n"
                 f"Average Layer Time: {sum(self.layer_times)/len(self.layer_times)*1000:.2f}ms\n"
                 f"Total Processing Time: {(datetime.now()-self.processing_start).total_seconds()*1000:.2f}ms\n"
                 f"Peak Memory Usage: {self.get_memory_usage():.2f}MB\n"
                 f"Safety Settings | Max Z Speed: {self.max_z_speed}mm/min | Min Move Time: {self.min_z_move_time}s\n"
+                f"Precision Mode: {self.precision_mode} | Min Feature: {self.min_feature_size}mm | Critical Angle: {self.critical_angle}°\n"
+                f"Valid Paths: Closed={self.closed_paths} | Open={self.open_paths}\n"
                 "═════════════════════════════════════════════════════════════"
             )
+            self.logger.info(final_report)
 
         finally:
-            # Clean up timestamped handler
-            self.logger.removeHandler(file_handler)
-            file_handler.close()
-
-            # Clean up temporary file if it still exists
-            if self.temp_path and os.path.exists(self.temp_path):
-                try:
-                    os.unlink(self.temp_path)
-                    self.logger.info(f"Cleaned up temporary file: {self.temp_path}")
-                except Exception as e:
-                    self.logger.error(
-                        f"Failed to clean up temporary file {self.temp_path}: {str(e)}"
-                    )
-            self.temp_path = None  # Reset tracking variable
-
-        return input_path
-
-    def get_memory_usage(self):
-        try:
-            import psutil
-
-            process = psutil.Process(os.getpid())
-            return process.memory_info().rss / 1024**2
-        except ImportError:
-            return 0.0  # Return 0 if psutil not installed
-        except Exception as e:
-            self.logger.warning(f"Memory tracking failed: {str(e)}")
-            return 0.0
+            self.logger.removeHandler(log_handler)
+            log_handler.close()
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Advanced G-code processor for 3D printing optimization"
+        description="Adaptive G-code Optimizer for Structural Printing"
     )
     parser.add_argument("input_file", help="Input G-code file path")
     parser.add_argument("-layerHeight", type=float, help="Manual layer height override")
@@ -728,12 +607,10 @@ def main():
         "-simplifyTolerance",
         type=float,
         default=0.03,
-        help="Simplification tolerance for ISO 2768 compliance",
+        help="Base simplification tolerance (mm)",
     )
     parser.add_argument(
-        "-bgcode",
-        action="store_true",
-        help="Enable for PrusaSlicer binary G-code processing",
+        "-bgcode", action="store_true", help="Enable for binary G-code processing"
     )
     parser.add_argument(
         "--logLevel",
@@ -745,49 +622,83 @@ def main():
         "-firstLayerMultiplier",
         type=float,
         default=None,
-        help="Extrusion multiplier for first layer (default: 1.5 × base multiplier)",
+        help="First layer extrusion multiplier",
     )
     parser.add_argument(
         "-lastLayerMultiplier",
         type=float,
         default=None,
-        help="Extrusion multiplier for last layer (default: 0.5 × base multiplier)",
+        help="Last layer extrusion multiplier",
     )
     parser.add_argument(
-        "-zSpeed",
-        type=float,
-        default=None,
-        help="Manual Z-axis move speed in mm/min (default: auto-detect from G-code)",
+        "-zSpeed", type=float, default=None, help="Manual Z-axis move speed"
     )
     parser.add_argument(
         "-maxAreaDev",
         type=float,
-        default=0.02,
-        help="Maximum allowed area deviation ratio (default: 0.02 = 2%%)",
+        default=0.06,
+        help="Max allowed geometry deviation (default: %(default).3f)",
     )
     parser.add_argument(
         "-hausdorffMult",
         type=float,
-        default=0.15,
-        help="Hausdorff distance multiplier (default: 0.15 = 15%% of feature size)",
+        default=0.3,
+        help="Simplification aggressiveness (default: %(default).2f)",
     )
     parser.add_argument(
         "-maxZSpeed",
         type=float,
-        default=300.0,
-        help="Maximum allowable Z-axis speed in mm/min (default: 300)",
+        default=6000.0,
+        help="Maximum allowable Z-axis speed",
     )
     parser.add_argument(
         "-minZMoveTime",
         type=float,
         default=0.5,
-        help="Minimum time (seconds) for small Z moves (default: 0.5)",
+        help="Minimum time for small Z moves",
     )
     parser.add_argument(
         "-safeZDistance",
         type=float,
         default=1.0,
-        help="Z distance threshold (mm) for speed adjustment (default: 1.0)",
+        help="Z distance threshold for speed adjustment",
+    )
+    parser.add_argument(
+        "--per-perimeter-shifts",
+        action="store_false",
+        dest="full_layer_shifts",
+        default=True,
+        help="Use per-perimeter Z-shifts",
+    )
+    parser.add_argument(
+        "-minDetail",
+        type=float,
+        default=0.2,
+        help="Minimum preserved feature size in mm (default: %(default).2f)",
+    )
+    parser.add_argument(
+        "-criticalAngle",
+        type=float,
+        default=25,
+        help="Preserve angles sharper than this (degrees)",
+    )
+    parser.add_argument(
+        "-precision",
+        choices=["auto", "high_precision", "balanced", "draft", "disabled"],
+        default="auto",
+        help=(
+            "Processing mode:\n"
+            "auto: Adapt based on model characteristics\n"
+            "high_precision: Maximum feature preservation\n"
+            "balanced: Optimized quality/speed\n"
+            "draft: Faster processing"
+        ),
+    )
+    parser.add_argument(
+        "-min_perimeter_points",
+        type=int,
+        default=3,  # Changed from 4
+        help="Minimum points for valid perimeter (default: %(default)d)",
     )
 
     args = parser.parse_args()
@@ -805,6 +716,10 @@ def main():
         max_z_speed=args.maxZSpeed,
         min_z_move_time=args.minZMoveTime,
         safe_z_distance=args.safeZDistance,
+        full_layer_shifts=args.full_layer_shifts,
+        min_feature_size=args.minDetail,
+        critical_angle=args.criticalAngle,
+        precision_mode=args.precision,
     )
     processor.process_gcode(args.input_file, args.bgcode)
 
