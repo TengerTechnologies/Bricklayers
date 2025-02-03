@@ -492,6 +492,22 @@ class GCodeProcessor:
             )
         return self.precision_mode
 
+    def _get_multiplier(self, is_last_layer):
+        """Determine extrusion multiplier based on layer position"""
+        if self.current_layer == 0:
+            return self.first_layer_multiplier
+        elif is_last_layer:
+            return self.last_layer_multiplier
+        return self.extrusion_multiplier
+
+    def _get_comment(self, is_last_layer):
+        """Generate appropriate comment for extrusion adjustments"""
+        if self.current_layer == 0:
+            return "first layer"
+        elif is_last_layer:
+            return "last layer"
+        return "adjusted extrusion"
+
     def _adjust_extrusion(self, line, is_last_layer):
         e_match = self.re_e.search(line)
         if e_match:
