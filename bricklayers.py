@@ -47,15 +47,18 @@ class GCodeProcessor:
         simplify_tolerance=0.03,
         log_level=logging.INFO,
         z_speed=None,
-        max_area_deviation=0.02,  # 2% default
-        hausdorff_multiplier=0.15,  # 15% default
+        max_area_deviation=0.02,
+        hausdorff_multiplier=0.15,
+        max_z_speed=300.0,
+        min_z_move_time=0.5,
+        safe_z_distance=1.0
     ):
         self.extrusion_multiplier = extrusion_multiplier
         self.first_layer_multiplier = (
             first_layer_multiplier
             if first_layer_multiplier is not None
             else 1.5 * extrusion_multiplier
-        )  # Scale base multiplier
+        )
         self.last_layer_multiplier = (
             last_layer_multiplier
             if last_layer_multiplier is not None
@@ -82,17 +85,26 @@ class GCodeProcessor:
         self.decoding_errors = 0
         self.max_area_deviation = max_area_deviation
         self.hausdorff_multiplier = hausdorff_multiplier
+        self.max_z_speed = max_z_speed
+        self.min_z_move_time = min_z_move_time
+        self.safe_z_distance = safe_z_distance
 
-        # Precompile regex patterns for performance
+        # Precompile regex patterns
         self.re_z = re.compile(r"Z([\d.]+)")
         self.re_f = re.compile(r"F([\d.]+)")
         self.re_e = re.compile(r"E([\d.]+)")
         self.re_e_sub = re.compile(r"E[\d.]+")
         self.re_x = re.compile(r"X([\d.]+)")
         self.re_y = re.compile(r"Y([\d.]+)")
-
-        # Unified logging configuration
+        
         self._configure_logging(log_level)
+
+    def _calculate_z_speed(self, delta_z):
+        """Calculate safe Z speed based on movement distance and safety parameters"""
+        if delta_z <= self.safe_z_distance:
+            required_speed = (delta_z / self.min_z_move_time) * 60  # Convert to mm/min
+            return min(self.max_z_speed, required_speed)
+        return self.max_z_speed
 
     def decode_line(self, line_bytes):
         try:
@@ -397,23 +409,18 @@ class GCodeProcessor:
 
     def process_layer(self, layer_lines, layer_num, total_layers):
         layer_start = datetime.now()
-
-        # Analyze perimeter geometry
         perimeter_paths = self.parse_perimeter_paths(layer_lines)
         outer_perimeters, inner_perimeters = self.classify_perimeters(perimeter_paths)
 
-        # Track line indices of internal perimeters
         internal_lines = set()
         for _, line_indices in inner_perimeters:
             internal_lines.update(line_indices)
 
-        # Processing state
         processed = []
         current_block = 0
         in_internal = False
-        current_f = None  # Tracks current feedrate
-        original_f = None  # Stores pre-shift feedrate
-        z_speed = 300  # Z-axis move speed (300mm/min = 5mm/s)
+        current_f = None
+        original_f = None
 
         # Initial feedrate detection
         for line in layer_lines:
@@ -421,68 +428,61 @@ class GCodeProcessor:
                 current_f = float(f_match.group(1))
                 break
 
-        # Process each line in layer
         for line_idx, line in enumerate(layer_lines):
-            # Update current feedrate from line
             if f_match := self.re_f.search(line):
                 current_f = float(f_match.group(1))
 
-            # Handle Z position updates
             if line.startswith("G1 Z"):
                 if z_match := self.re_z.search(line):
                     self.current_z = float(z_match.group(1))
 
-            # Internal perimeter processing
             if line_idx in internal_lines:
                 if not in_internal:
                     # Start of internal perimeter block
                     current_block += 1
-                    original_f = current_f  # Capture pre-shift feedrate
+                    original_f = current_f
                     z_shift = self.layer_height * 0.5 if current_block % 2 else 0
+                    delta_z = abs(z_shift)
 
-                    # Insert Z-shift with isolated Z-speed
+                    # Calculate dynamic speed for upward move
+                    dynamic_up_speed = self._calculate_z_speed(delta_z)
                     processed.append(
-                        f"G1 Z{self.current_z + z_shift:.3f} F{z_speed} ; Z-shift block {current_block}\n"
+                        f"G1 Z{self.current_z + z_shift:.3f} F{dynamic_up_speed} ; Z-shift block {current_block}\n"
                     )
 
-                    # Restore original XY feedrate
                     if original_f is not None:
                         processed.append(f"G1 F{original_f:.1f} ; Restore feedrate\n")
                     else:
-                        self.logger.warning(
-                            f"No feedrate captured before Z-shift at layer {layer_num}"
-                        )
+                        self.logger.warning(f"No feedrate captured before Z-shift at layer {layer_num}")
 
                     in_internal = True
                     self.shifted_blocks += 1
 
-                # Apply extrusion adjustments
                 processed.append(
                     self._adjust_extrusion(line, layer_num == total_layers - 1)
                 )
             else:
                 if in_internal:
-                    # End of internal perimeter block
+                    # Calculate dynamic speed for downward reset
+                    z_shift = self.layer_height * 0.5 if (current_block % 2) else 0
+                    delta_z = abs(z_shift)
+                    dynamic_down_speed = self._calculate_z_speed(delta_z)
+                    
                     processed.append(
-                        f"G1 Z{self.current_z:.3f} F{z_speed} ; Reset Z position\n"
+                        f"G1 Z{self.current_z:.3f} F{dynamic_down_speed} ; Reset Z position\n"
                     )
 
-                    # Restore current feedrate at block exit
                     if current_f is not None:
-                        processed.append(
-                            f"G1 F{current_f:.1f} ; Resume outer feedrate\n"
-                        )
+                        processed.append(f"G1 F{current_f:.1f} ; Resume outer feedrate\n")
 
                     in_internal = False
                 processed.append(line)
 
-        # Performance logging
         self.layer_times.append((datetime.now() - layer_start).total_seconds())
         self.logger.info(
             f"Layer {layer_num+1}: Shifted {current_block} blocks | "
             f"Feedrate preservation: {original_f or 'default'}"
         )
-
         return processed
 
     def process_gcode(self, input_file, is_bgcode=False):
@@ -600,6 +600,7 @@ class GCodeProcessor:
                 f"Average Layer Time: {sum(self.layer_times)/len(self.layer_times)*1000:.2f}ms\n"
                 f"Total Processing Time: {(datetime.now()-self.processing_start).total_seconds()*1000:.2f}ms\n"
                 f"Peak Memory Usage: {self.get_memory_usage():.2f}MB\n"
+                f"Safety Settings | Max Z Speed: {self.max_z_speed}mm/min | Min Move Time: {self.min_z_move_time}s\n"
                 "═════════════════════════════════════════════════════════════"
             )
 
@@ -693,6 +694,24 @@ def main():
         default=0.15,
         help="Hausdorff distance multiplier (default: 0.15 = 15%% of feature size)",
     )
+    parser.add_argument(
+        "-maxZSpeed",
+        type=float,
+        default=300.0,
+        help="Maximum allowable Z-axis speed in mm/min (default: 300)",
+    )
+    parser.add_argument(
+        "-minZMoveTime",
+        type=float,
+        default=0.5,
+        help="Minimum time (seconds) for small Z moves (default: 0.5)",
+    )
+    parser.add_argument(
+        "-safeZDistance",
+        type=float,
+        default=1.0,
+        help="Z distance threshold (mm) for speed adjustment (default: 1.0)",
+    )
 
     args = parser.parse_args()
 
@@ -706,6 +725,9 @@ def main():
         z_speed=args.zSpeed,
         max_area_deviation=args.maxAreaDev,
         hausdorff_multiplier=args.hausdorffMult,
+        max_z_speed=args.maxZSpeed,
+        min_z_move_time=args.minZMoveTime,
+        safe_z_distance=args.safeZDistance,
     )
     processor.process_gcode(args.input_file, args.bgcode)
 
