@@ -1,85 +1,216 @@
-# Bricklayers G-code Post Processor
 
-Open-source tool for modifying 3D printing G-code files to alternate Z-axis layer heights on internal perimeters.
+# Bricklayers Adaptive G-code Optimizer
+
+Advanced post-processor for structural 3D printing optimization leveraging "bricklayers" with intelligent Z-axis patterning and precision-aware geometry processing.
 
 [![Demonstration Video](https://img.youtube.com/vi/EqRdQOoK5hc/0.jpg)](https://www.youtube.com/watch?v=EqRdQOoK5hc)
 
-## Key Features
+## 🚀 Key Enhancements
 
-- Compatible with common slicing software output
-- Adjustable Z-axis layer shift patterns
-- Configurable extrusion multipliers
-- Automatic layer height detection
-- Basic geometry validation
+- **Adaptive Precision Engine** - Auto-detects optimal processing mode based on model characteristics
+- **Structural Layer Shifting** - Full-layer or per-perimeter Z-axis alternation patterns
+- **Smart Feature Preservation** - Maintains critical details while optimizing print geometry
+- **Industrial-Grade Parameters** - Configurable for professional-grade printing requirements
+- **Advanced Diagnostics** - Detailed path analysis and memory optimization
 
-## Requirements
+## 📋 Requirements
 
-- Python 3.9+ ([python.org](https://www.python.org/))
-- 64-bit operating system recommended
-- 2X free RAM relative to G-code file size
+- Python 3.10+ (64-bit mandatory)
+- 4GB+ free RAM (8GB recommended for complex models)
+- SSD storage recommended for large files (>500MB)
 
-## Installation
+## ⚙️ Installation
 
-1. Install Python dependencies:
+1. Install core dependencies:
 
-   ```bash
-   pip install shapely
-   pip install psutil # Optional, for memory usage logging
-   ```
-2. Download script:
-
-   ```
-   wget https://example.com/bricklayers.py
-   ```
-
-
-## Usage Instructions
-
-### Basic Configuration
-
-bash
-
-```
-python bricklayers.py input.gcode -layerHeight 0.2
+```bash
+pip install "shapely>=2.0"
+pip install "psutil>=5.9"  # Optional for memory usage tracking
 ```
 
-### Full Parameter List
+3. Download latest version by cloning the repo.
 
-bash
+## 🛠 Quick Start Guide
 
-```
-python bricklayers.py input.gcode \
-  -layerHeight 0.2 \
-  -extrusionMultiplier 1.2 \
-  -simplifyTolerance 0.03 \
-  -bgcode \
-  --logLevel INFO
+### Basic Structural Optimization
+
+```bash
+python bricklayers.py input.gcode --precision balanced
 ```
 
-## Technical Notes
+### Professional Quality Profile
 
-* Processes standard G-code (ASCII) and Prusa binary formats
-* Creates backup files with timestamped logs
-* Detailed processing reports in `bricklayers.log`
+```bash
+python bricklayers.py aerospace_part.gcode \
+  --precision high_precision \
+  --minDetail 0.15 \
+  --criticalAngle 30 \
+  --maxZSpeed 4500 \
+  --hausdorffMult 0.2
+```
 
-## Important Disclaimers
+### Production Speed Profile
 
-This software is provided **as-is** without any warranties. By using this tool, you agree:
+```bash
+python bricklayers.py prototype.gcode \
+  --precision draft \
+  --fullLayerShifts \
+  --minDetail 0.4 \
+  --maxZSpeed 12000
+```
 
-1. To validate all processed files in simulation software before printing
-2. That improper use may damage printers or create hazardous conditions
-3. The authors are not liable for material losses or printer damage
+## 🔧 Advanced Configuration
 
-> Test on non-critical prints first. Not certified for medical/safety-critical applications.
+### Core Parameters
 
-## License
+| Parameter             | Values                            | Description                               |
+| --------------------- | --------------------------------- | ----------------------------------------- |
+| `--precision`       | auto/high/balanced/draft/disabled | Processing rigor level                    |
+| `--minDetail`       | 0.1-1.0 (mm)                      | Minimum preserved feature size            |
+| `--criticalAngle`   | 15-45 (degrees)                   | Sharpest angle to maintain                |
+| `--fullLayerShifts` | Flag                              | Enable structural full-layer Z patterning |
 
-GNU General Public License v3.0
+### ⚙️ Complete Parameter Reference
 
-Copyright © 2025 Roman Tenger
+### Layer Configuration
+
+| Parameter               | Type  | Default | Description                               |
+| ----------------------- | ----- | ------- | ----------------------------------------- |
+| `-layerHeight`        | float | Auto    | Manual layer height override (mm)         |
+| `-fullLayerShifts`    | flag  | On      | Structural full-layer Z patterning        |
+| `-perPerimeterShifts` | flag  | Off     | Legacy per-perimeter Z shifts             |
+| `-minZMoveTime`       | float | 0.5     | Minimum Z move duration (seconds)         |
+| `-safeZDistance`      | float | 1.0     | Safety threshold for Z speed ramping (mm) |
+
+### Extrusion Control
+
+| Parameter                 | Type  | Default | Description                        |
+| ------------------------- | ----- | ------- | ---------------------------------- |
+| `-extrusionMultiplier`  | float | 1.0     | Global extrusion multiplier        |
+| `-firstLayerMultiplier` | float | 1.5×   | First layer flow boost             |
+| `-lastLayerMultiplier`  | float | 0.5×   | Final layer reduction              |
+| `-simplifyTolerance`    | float | 0.03    | Base simplification tolerance (mm) |
+
+### Geometry Processing
+
+| Parameter                 | Type  | Default | Description                             |
+| ------------------------- | ----- | ------- | --------------------------------------- |
+| `-minDetail`            | float | 0.2     | Minimum preserved feature size (mm)     |
+| `-criticalAngle`        | float | 25      | Minimum preserved angle (degrees)       |
+| `-hausdorffMult`        | float | 0.3     | Simplification aggressiveness (0.1-1.0) |
+| `-maxAreaDev`           | float | 0.06    | Maximum area deviation (1=100%)         |
+| `-min_perimeter_points` | int   | 3       | Minimum points to validate perimeter    |
+
+### Speed Configuration
+
+| Parameter      | Type  | Default | Description                   |
+| -------------- | ----- | ------- | ----------------------------- |
+| `-maxZSpeed` | float | 6000    | Maximum Z-axis speed (mm/min) |
+| `-zSpeed`    | float | Auto    | Manual Z move speed override  |
+
+### Precision Controls
+
+| Parameter       | Values                            | Description                        |
+| --------------- | --------------------------------- | ---------------------------------- |
+| `--precision` | auto/high/balanced/draft/disabled | Processing rigor level             |
+| `-bgcode`     | flag                              | Enable Prusa binary G-code support |
+
+### Diagnostic Parameters
+
+| Parameter      | Values                            | Description      |
+| -------------- | --------------------------------- | ---------------- |
+| `--logLevel` | DEBUG/INFO/WARNING/ERROR/CRITICAL | Output verbosity |
 
 ---
 
-*Not affiliated with or endorsed by Prusa Research, Bambu Lab, or Anycubic.
+## Example Full Configuration
 
-All trademarks remain property of their respective owners.*
+bash
+
+```
+python bricklayers2.py high_precision_part.gcode \
+  -layerHeight 0.15 \
+  -extrusionMultiplier 1.05 \
+  -firstLayerMultiplier 1.8 \
+  -lastLayerMultiplier 0.4 \
+  -simplifyTolerance 0.02 \
+  -minDetail 0.12 \
+  -criticalAngle 30 \
+  -hausdorffMult 0.25 \
+  -maxAreaDev 0.04 \
+  -maxZSpeed 8000 \
+  -minZMoveTime 0.75 \
+  -safeZDistance 1.5 \
+  -minPerimeterPoints 4 \
+  --precision high_precision \
+  --logLevel DEBUG
+```
+
+
+### Optimization Controls
+
+```bash
+# Geometry Processing
+--hausdorffMult 0.3      # Simplification aggressiveness (0.1-1.0)
+--maxAreaDev 0.06        # Maximum allowed geometry deviation (1-10%)
+
+# Speed Configuration
+--maxZSpeed 6000         # Maximum Z-axis speed (mm/min)
+--minZMoveTime 0.5       # Minimum layer shift duration (seconds)
+
+# Advanced Features
+--perPerimeterShifts   # Legacy per-perimeter mode (not recommended)
+--minPerimeterPoints 3 # Minimum points to consider valid perimeter
+```
+
+## 📊 Diagnostic Features
+
+* Layer-by-layer processing statistics
+* Path closure validation tracking
+* Small feature preservation reports
+* Memory optimization profiling
+* Error resilience logging
+
+## ⚠️ Critical Safety Protocols
+
+**By using this software, you acknowledge and agree:**
+
+1. **Mandatory Pre-Validation**
+
+   All processed files must undergo:
+
+   * Full G-code simulation
+   * Thermal stress analysis
+   * Mechanical property verification
+2. **Safety Certification**
+
+   Not approved for:
+
+   * Medical implants
+   * Aerospace components
+   * Load-bearing structures
+   * Safety-critical applications
+3. **Liability Disclaimer**
+
+   The developers assume **no responsibility** for:
+
+   * Printer damage
+   * Material losses
+   * Production downtime
+   * Secondary damages from printed objects
+
+> **WARNING:** Always conduct test prints at 50% scale before full production. Monitor first 10 layers manually.
+
+## 📜 License Compliance
+
+GNU GPLv3 - Full text included with distribution. By using this software:
+
+* You must disclose source code modifications
+* Commercial use requires explicit authorization
+* No warranty protection provided
+
+---
+
+*This project is not affiliated with Bambu Lab, Prusa Research, UltiMaker, or any commercial 3D printing vendor.
+
+All trademarks remain property of their respective owners. Use of vendor logos strictly prohibited.*
