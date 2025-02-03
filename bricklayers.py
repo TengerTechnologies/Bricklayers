@@ -517,7 +517,8 @@ class GCodeProcessor:
         # Process layers with streaming
         with open(input_path, "r") as f:
             with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                total_layers = sum(
+                # Initialize total layers count
+                self.total_layers = sum(  # Store as instance variable
                     1 for line in iter(mm.readline, b"") if line.startswith(b"G1 Z")
                 )
                 mm.seek(0)
@@ -536,7 +537,7 @@ class GCodeProcessor:
                     ):
                         if layer_buffer:
                             processed = self.process_layer(
-                                layer_buffer, current_layer, total_layers
+                                layer_buffer, current_layer, self.total_layers
                             )
                             temp_file.writelines(processed)
                             current_layer += 1
@@ -544,7 +545,7 @@ class GCodeProcessor:
 
                 if layer_buffer:
                     processed = self.process_layer(
-                        layer_buffer, current_layer, total_layers
+                        layer_buffer, current_layer, self.total_layers
                     )
                     temp_file.writelines(processed)
 
