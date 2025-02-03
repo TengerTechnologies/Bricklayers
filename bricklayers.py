@@ -108,6 +108,8 @@ class GCodeProcessor:
         self.travel_threshold = 0.2  # mm
         self.closed_paths = 0
         self.open_paths = 0
+        self.extrusion_mode = "absolute"  # Default assumption
+        self.last_e_value = 0.0
 
         # Regex patterns
         self.re_z = re.compile(r"Z([\d.]+)")
@@ -449,7 +451,7 @@ class GCodeProcessor:
 
         processed = []
         current_z = None
-        shift_amount = self.layer_height * 0.25
+        shift_amount = self.layer_height * 0.5
 
         for line in layer_lines:
             original_line = line
@@ -460,7 +462,7 @@ class GCodeProcessor:
                     current_z = float(z_match.group(1))
                     if shift_layer:
                         new_z = current_z + shift_amount
-                        line = f"G1 Z{new_z:.3f} F{self.z_speed}\n"
+                        line = f"G1 Z{new_z:.3f} F{self.z_speed} ; SHIFT_APPLIED ({shift_amount:.3f}mm)\n"
                         processed.append(line)
                         continue
 
@@ -530,13 +532,22 @@ class GCodeProcessor:
             self.layer_height = self.layer_height or self.detect_layer_height(
                 input_path
             )
-            self.z_shift = self.layer_height * 0.25
+            self.z_shift = self.layer_height * 0.5
             self.z_speed = self.z_speed or self.detect_z_speed(input_path)
 
             with open(input_path, "r+") as f:
                 with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                    # Detect layer change comment based on printer type
+                    layer_change_marker = {
+                        PrinterType.BAMBU.value: "; CHANGE_LAYER",
+                        PrinterType.PRUSA.value: ";LAYER_CHANGE",
+                    }[self.printer_type]
+
+                    # Count total layers based on layer change comments
                     self.total_layers = sum(
-                        1 for line in iter(mm.readline, b"") if b"G1 Z" in line
+                        1
+                        for line in iter(mm.readline, b"")
+                        if layer_change_marker in self.decode_line(line)
                     )
                     mm.seek(0)
 
@@ -546,12 +557,17 @@ class GCodeProcessor:
 
                         for line in iter(mm.readline, b""):
                             decoded_line = self.decode_line(line)
+
+                            # Track extrusion mode changes
+                            if "M82" in decoded_line:
+                                self.extrusion_mode = "absolute"
+                            elif "M83" in decoded_line:
+                                self.extrusion_mode = "relative"
+
                             layer_buffer.append(decoded_line)
 
-                            if (
-                                "G1 Z" in decoded_line
-                                or "; CHANGE_LAYER" in decoded_line
-                            ):
+                            # Split layers ONLY at the correct layer change markers
+                            if layer_change_marker in decoded_line:
                                 processed = self.process_layer(
                                     layer_buffer, current_layer, self.total_layers
                                 )
@@ -559,6 +575,7 @@ class GCodeProcessor:
                                 current_layer += 1
                                 layer_buffer = []
 
+                        # Process remaining lines after last layer marker
                         if layer_buffer:
                             processed = self.process_layer(
                                 layer_buffer, current_layer, self.total_layers
