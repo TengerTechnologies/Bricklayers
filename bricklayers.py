@@ -113,6 +113,7 @@ class GCodeProcessor:
         self.lateral_shift = 0.3  # Fraction of layer width to shift
         self.vertical_shift = 0.5  # Fraction of layer height to shift
         self.layer_parity = 1  # Track even/odd layers
+        self.actual_z = 0.0  # Track printed Z
 
         # Regex patterns
         self.re_z = re.compile(r"Z([\d.]+)")
@@ -445,31 +446,33 @@ class GCodeProcessor:
         perimeter_paths = self.parse_perimeter_paths(layer_lines)
         outer, inner = self.classify_perimeters(perimeter_paths)
 
-        # Always apply shifts for brick layering
+        # Determine shift direction for brick pattern
         self.layer_parity = 1 if layer_num % 2 == 0 else -1
         x_offset = self.layer_height * self.lateral_shift * self.layer_parity
-        z_shift = self.layer_height * self.vertical_shift * self.layer_parity
+        shift_amount = self.layer_parity * self.layer_height * 0.5
 
         # Track shifted layers
         self.shifted_blocks += 1
         self.layer_shift_pattern.append(1)
 
         processed = []
-        current_z = None
+        z_shift_applied = False  # Track if we've processed the Z shift
 
         for line in layer_lines:
             original_line = line
 
-            # Apply cumulative vertical Z-shift to layer changes
-            if self.full_layer_shifts and line.startswith("G1 Z"):
+            # Apply vertical Z-shift ONLY to the first G1 Z in the layer
+            if (
+                self.full_layer_shifts
+                and not z_shift_applied
+                and line.startswith("G1 Z")
+            ):
                 z_match = self.re_z.search(line)
                 if z_match:
                     current_z = float(z_match.group(1))
-                    # Shift relative to previous layer, not nominal Z
-                    new_z = current_z + (self.layer_parity * self.layer_height * 0.5)
-                    line = f"G1 Z{new_z:.3f} F{self.z_speed} ; SHIFT_APPLIED ({self.layer_parity * self.layer_height * 0.5:.3f}mm)\n"
-                    processed.append(line)
-                    continue
+                    new_z = current_z + shift_amount
+                    line = f"G1 Z{new_z:.3f} F{self.z_speed} ; SHIFT_APPLIED ({shift_amount:.3f}mm)\n"
+                    z_shift_applied = True
 
             # Apply lateral X/Y shifts to perimeters
             if any(marker in line for marker in [";TYPE:", "; FEATURE:"]):
@@ -484,13 +487,13 @@ class GCodeProcessor:
             # Extrusion adjustment
             if "E" in line:
                 line = self._adjust_extrusion(line, layer_num == total_layers - 1)
-                self.total_extrusion_adjustments += 1  # Track adjustments
+                self.total_extrusion_adjustments += 1
 
             processed.append(line)
 
         self.layer_times.append((datetime.now() - layer_start).total_seconds())
         self.logger.info(
-            f"Layer {layer_num+1}: Z-shift={z_shift:.3f}mm, XY-shift={x_offset:.3f}mm"
+            f"Layer {layer_num+1}: Z-shift={shift_amount:.3f}mm, XY-shift={x_offset:.3f}mm"
         )
         return processed
 
