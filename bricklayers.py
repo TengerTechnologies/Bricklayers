@@ -47,6 +47,8 @@ class GCodeProcessor:
         simplify_tolerance=0.03,
         log_level=logging.INFO,
         z_speed=None,
+        max_area_deviation=0.02,  # 2% default
+        hausdorff_multiplier=0.15,  # 15% default
     ):
         self.extrusion_multiplier = extrusion_multiplier
         self.first_layer_multiplier = (
@@ -78,6 +80,8 @@ class GCodeProcessor:
         self.simplified_features = 0
         self.failed_simplifications = 0
         self.decoding_errors = 0
+        self.max_area_deviation = max_area_deviation
+        self.hausdorff_multiplier = hausdorff_multiplier
 
         # Unified logging configuration
         self._configure_logging(log_level)
@@ -222,20 +226,17 @@ class GCodeProcessor:
         if not simplified.is_valid:
             return False
 
-        # Calculate relative deviations
-        area_deviation = abs(original.area - simplified.area) / original.area
-        max_distance = original.hausdorff_distance(simplified)
-
-        # Dynamic thresholds based on feature size
         min_dimension = min(
             original.bounds[2] - original.bounds[0],
             original.bounds[3] - original.bounds[1],
         )
-
+        
         return (
-            area_deviation < 0.02
-            and max_distance < min_dimension * 0.15
-            and len(simplified.exterior.coords) >= 4
+            # Use configured area deviation
+            (abs(original.area - simplified.area)/original.area < self.max_area_deviation) and
+            # Scale Hausdorff threshold with both feature size and configuration
+            (original.hausdorff_distance(simplified) < min_dimension * self.hausdorff_multiplier) and
+            (len(simplified.exterior.coords) >= 4)
         )
 
     def parse_perimeter_paths(self, layer_lines):
@@ -648,6 +649,18 @@ def main():
         default=None,
         help="Manual Z-axis move speed in mm/min (default: auto-detect from G-code)",
     )
+    parser.add_argument(
+        "-maxAreaDev",
+        type=float,
+        default=0.02,
+        help="Maximum allowed area deviation ratio (default: 0.02 = 2%%)",
+    )
+    parser.add_argument(
+        "-hausdorffMult",
+        type=float,
+        default=0.15,
+        help="Hausdorff distance multiplier (default: 0.15 = 15%% of feature size)",
+    )
 
     args = parser.parse_args()
 
@@ -659,6 +672,8 @@ def main():
         extrusion_multiplier=args.extrusionMultiplier,
         simplify_tolerance=args.simplifyTolerance,
         z_speed=args.zSpeed,
+        max_area_deviation=args.maxAreaDev,
+        hausdorff_multiplier=args.hausdorffMult,
     )
     processor.process_gcode(args.input_file, args.bgcode)
 
