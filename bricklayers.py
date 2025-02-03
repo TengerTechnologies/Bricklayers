@@ -230,13 +230,20 @@ class GCodeProcessor:
             original.bounds[2] - original.bounds[0],
             original.bounds[3] - original.bounds[1],
         )
-        
+
         return (
             # Use configured area deviation
-            (abs(original.area - simplified.area)/original.area < self.max_area_deviation) and
+            (
+                abs(original.area - simplified.area) / original.area
+                < self.max_area_deviation
+            )
+            and
             # Scale Hausdorff threshold with both feature size and configuration
-            (original.hausdorff_distance(simplified) < min_dimension * self.hausdorff_multiplier) and
-            (len(simplified.exterior.coords) >= 4)
+            (
+                original.hausdorff_distance(simplified)
+                < min_dimension * self.hausdorff_multiplier
+            )
+            and (len(simplified.exterior.coords) >= 4)
         )
 
     def parse_perimeter_paths(self, layer_lines):
@@ -356,7 +363,24 @@ class GCodeProcessor:
         for idx, (poly, lines) in enumerate(perimeter_paths):
             candidate_idxs = tree.query(poly)
             candidates = [polygons[i] for i in candidate_idxs if i != idx]
-            if any(c.contains(poly) for c in candidates):
+            is_inner = False
+
+            for candidate in candidates:
+                # Only consider candidates larger than current polygon (likely outer)
+                if candidate.area > poly.area:
+                    # Full containment check
+                    if candidate.contains(poly):
+                        is_inner = True
+                        break
+                    # Partial overlap check using max_intersection_area threshold
+                    intersection = candidate.intersection(poly)
+                    if not intersection.is_empty:
+                        overlap_ratio = intersection.area / poly.area
+                        if overlap_ratio > self.max_intersection_area:
+                            is_inner = True
+                            break
+
+            if is_inner:
                 inner.append((poly, lines))
             else:
                 outer.append((poly, lines))
