@@ -79,54 +79,34 @@ class GCodeProcessor:
         self.simplified_features = 0
         self.failed_simplifications = 0
 
-        # Initialize logger
+        # Unified logging configuration
+        self._configure_logging(log_level)
+
+    def _configure_logging(self, log_level):
+        """Centralized logging with rotation and timestamped files."""
         self.logger = logging.getLogger("Bricklayers")
         self.logger.setLevel(log_level)
 
-        # Prevent duplicate handlers
         if not self.logger.hasHandlers():
             formatter = logging.Formatter(
                 "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
             )
 
-            # Rotating file handler
-            file_handler = logging.handlers.RotatingFileHandler(
-                "bricklayers.log", maxBytes=10 * 1024 * 1024, backupCount=5  # 10MB
-            )
-            file_handler.setFormatter(formatter)
-
-            # Console handler
-            console_handler = logging.StreamHandler()
-            console_handler.setFormatter(formatter)
-
-            self.logger.addHandler(file_handler)
-            self.logger.addHandler(console_handler)
-
-    def _configure_log_handlers(self):
-        """Establish robust logging infrastructure with failsafe rotation.
-
-        Implements RFC-5424 compliant logging with:
-        - 10MB rolling file storage
-        - Simultaneous console output
-        - Coordinated Universal Time timestamps
-        """
-        if not self.logger.hasHandlers():
-            formatter = logging.Formatter(
-                "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
-            )
-
-            file_handler = logging.handlers.RotatingFileHandler(
+            # Rotating main log (keep latest runs)
+            rotating_handler = logging.handlers.RotatingFileHandler(
                 "bricklayers.log",
-                maxBytes=10 * 1024 * 1024,  # 10MB per file
-                backupCount=5,  # 50MB total history
+                maxBytes=10 * 1024 * 1024,
+                backupCount=5,
                 encoding="utf-8",
             )
-            file_handler.setFormatter(formatter)
+            rotating_handler.setFormatter(formatter)
 
+            # Error console output
             console_handler = logging.StreamHandler()
+            console_handler.setLevel(logging.ERROR)
             console_handler.setFormatter(formatter)
 
-            self.logger.addHandler(file_handler)
+            self.logger.addHandler(rotating_handler)
             self.logger.addHandler(console_handler)
 
     def detect_printer_type(self, file_path):
@@ -472,103 +452,113 @@ class GCodeProcessor:
         return processed
 
     def process_gcode(self, input_file, is_bgcode=False):
-        """Execute full G-code processing pipeline with rigorous error handling.
-
-        Args:
-            input_file: Path to source G-code file
-            is_bgcode: Flag for Prusa-format binary G-code decoding
-
-        Returns:
-            Path: Location of processed file
-
-        Safety Features:
-            - Memory-mapped file handling for large model safety
-            - Atomic writes using temporary files prevent data loss
-            - Comprehensive audit logging with performance metrics
-            - Automatic binary G-code translation when needed
-
-        Processing Workflow:
-            1. Printer detection and auto-configuration
-            2. Layer height validation/calculation
-            3. Streaming layer-by-layer processing
-            4. Cleanup and verification
-        """
+        """Execute full G-code processing pipeline with dual logging."""
         self.processing_start = datetime.now()
         script_dir = os.path.dirname(os.path.abspath(__file__))
+
+        # Generate timestamped log filename
         current_time = datetime.now().astimezone().strftime("%Y-%m-%d_%H-%M-%S_GMT%z")
-        log_filename = os.path.join(script_dir, f"z_shift_{current_time}.log")
-        logging.basicConfig(
-            filename=log_filename,
-            level=logging.INFO,
-            format="%(asctime)s - %(message)s",
+        timestamped_log = os.path.join(script_dir, f"bricklayers_{current_time}.log")
+
+        # Create timestamped log handler
+        file_handler = logging.FileHandler(timestamped_log, encoding="utf-8")
+        file_handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+            )
         )
+        self.logger.addHandler(file_handler)
 
-        input_path = Path(input_file)
-        if is_bgcode:
-            input_path = input_path.with_suffix(".gcode")
-            os.system(f"bgcode decode {input_file} -o {input_path}")
+        try:
+            self.logger.info("═" * 55)
+            self.logger.info(f"Starting processing of {input_file}")
+            self.logger.info(f"Timestamped log: {timestamped_log}")
 
-        # Memory-mapped metadata detection
-        self.printer_type = self.detect_printer_type(input_path)
-        if self.layer_height is None:
-            self.layer_height = self.detect_layer_height(input_path)
-        self.z_shift = self.layer_height * 0.5
+            input_path = Path(input_file)
+            if is_bgcode:
+                input_path = input_path.with_suffix(".gcode")
+                self.logger.info(f"Decoding binary G-code to: {input_path}")
+                os.system(f"bgcode decode {input_file} -o {input_path}")
 
-        # Process layers with streaming
-        with open(input_path, "r") as f:
-            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                # Initialize total layers count
-                self.total_layers = sum(  # Store as instance variable
-                    1 for line in iter(mm.readline, b"") if line.startswith(b"G1 Z")
-                )
-                mm.seek(0)
+            # Printer detection and layer height calculation
+            self.logger.info("Detecting printer type...")
+            self.printer_type = self.detect_printer_type(input_path)
 
-                temp_file = NamedTemporaryFile(mode="w", delete=False)
-                layer_buffer = []
-                current_layer = 0
+            if self.layer_height is None:
+                self.logger.info("Auto-detecting layer height...")
+                self.layer_height = self.detect_layer_height(input_path)
 
-                for line in iter(mm.readline, b""):
-                    decoded_line = line.decode("utf-8", errors="ignore")
-                    layer_buffer.append(decoded_line)
+            self.z_shift = self.layer_height * 0.5
+            self.logger.info(
+                f"Layer height: {self.layer_height:.2f}mm | Z-shift: {self.z_shift:.2f}mm"
+            )
 
-                    if (
-                        decoded_line.startswith("G1 Z")
-                        or "; CHANGE_LAYER" in decoded_line
-                    ):
+            # Streaming layer processing
+            with open(input_path, "r") as f:
+                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                    self.logger.info("Counting total layers...")
+                    self.total_layers = sum(
+                        1 for line in iter(mm.readline, b"") if line.startswith(b"G1 Z")
+                    )
+                    mm.seek(0)
+                    self.logger.info(f"Found {self.total_layers} layers to process")
+
+                    with NamedTemporaryFile(mode="w", delete=False) as temp_file:
+                        layer_buffer = []
+                        current_layer = 0
+
+                        self.logger.info("Begin layer processing...")
+                        for line in iter(mm.readline, b""):
+                            decoded_line = line.decode("utf-8", errors="ignore")
+                            layer_buffer.append(decoded_line)
+
+                            if (
+                                decoded_line.startswith("G1 Z")
+                                or "; CHANGE_LAYER" in decoded_line
+                            ):
+                                if layer_buffer:
+                                    processed = self.process_layer(
+                                        layer_buffer, current_layer, self.total_layers
+                                    )
+                                    temp_file.writelines(processed)
+                                    current_layer += 1
+                                    layer_buffer = []
+
                         if layer_buffer:
                             processed = self.process_layer(
                                 layer_buffer, current_layer, self.total_layers
                             )
                             temp_file.writelines(processed)
-                            current_layer += 1
-                            layer_buffer = []
 
-                if layer_buffer:
-                    processed = self.process_layer(
-                        layer_buffer, current_layer, self.total_layers
-                    )
-                    temp_file.writelines(processed)
+                        temp_path = temp_file.name
 
-                temp_file.close()
-                os.replace(temp_file.name, input_path)
+                    os.replace(temp_path, input_path)
+                    self.logger.info(f"Processed file saved to: {input_path}")
 
-        if is_bgcode:
-            os.system(f"bgcode encode {input_path}")
-            input_path.unlink()
+            if is_bgcode:
+                self.logger.info("Re-encoding to binary G-code format...")
+                os.system(f"bgcode encode {input_path}")
+                input_path.unlink()
 
-        logging.info(f"Processed {self.shifted_blocks} internal perimeter blocks")
-        logging.info(
-            "════════════════════ Processing Complete ════════════════════\n"
-            f"Total Layers Processed: {self.total_layers}\n"
-            f"Total Z-Shifts Applied: {self.shifted_blocks}\n"
-            f"Extrusion Adjustments: {self.total_extrusion_adjustments}\n"
-            f"Simplified Features: {self.simplify_success_count}\n"
-            f"Failed Simplifications: {self.failed_simplifications}\n"
-            f"Average Layer Time: {sum(self.layer_times)/len(self.layer_times) * 1000:.2f}ms\n"  # Changed to ms
-            f"Total Processing Time: {(datetime.now()-self.processing_start).total_seconds() * 1000:.2f}ms\n"  # Changed to ms
-            f"Peak Memory Usage: {self.get_memory_usage():.2f}MB\n"
-            "═════════════════════════════════════════════════════════════"
-        )
+            # Final report
+            self.logger.info(
+                "════════════════════ Processing Complete ════════════════════\n"
+                f"Total Layers Processed: {self.total_layers}\n"
+                f"Total Z-Shifts Applied: {self.shifted_blocks}\n"
+                f"Extrusion Adjustments: {self.total_extrusion_adjustments}\n"
+                f"Simplified Features: {self.simplify_success_count}\n"
+                f"Failed Simplifications: {self.failed_simplifications}\n"
+                f"Average Layer Time: {sum(self.layer_times)/len(self.layer_times)*1000:.2f}ms\n"
+                f"Total Processing Time: {(datetime.now()-self.processing_start).total_seconds()*1000:.2f}ms\n"
+                f"Peak Memory Usage: {self.get_memory_usage():.2f}MB\n"
+                "═════════════════════════════════════════════════════════════"
+            )
+
+        finally:
+            # Clean up timestamped handler
+            self.logger.removeHandler(file_handler)
+            file_handler.close()
+
         return input_path
 
     def get_memory_usage(self):
