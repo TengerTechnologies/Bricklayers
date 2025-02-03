@@ -445,10 +445,14 @@ class GCodeProcessor:
         perimeter_paths = self.parse_perimeter_paths(layer_lines)
         outer, inner = self.classify_perimeters(perimeter_paths)
 
-        # Determine shift direction for brick pattern
+        # Always apply shifts for brick layering
         self.layer_parity = 1 if layer_num % 2 == 0 else -1
         x_offset = self.layer_height * self.lateral_shift * self.layer_parity
         z_shift = self.layer_height * self.vertical_shift * self.layer_parity
+
+        # Track shifted layers
+        self.shifted_blocks += 1
+        self.layer_shift_pattern.append(1)
 
         processed = []
         current_z = None
@@ -456,12 +460,14 @@ class GCodeProcessor:
         for line in layer_lines:
             original_line = line
 
-            # Apply vertical Z-shift to layer changes
+            # Apply cumulative vertical Z-shift to layer changes
             if self.full_layer_shifts and line.startswith("G1 Z"):
                 z_match = self.re_z.search(line)
                 if z_match:
-                    current_z = float(z_match.group(1)) + z_shift
-                    line = f"G1 Z{current_z:.3f} F{self.z_speed} ; SHIFT_APPLIED (Z={z_shift:.3f}mm)\n"
+                    current_z = float(z_match.group(1))
+                    # Shift relative to previous layer, not nominal Z
+                    new_z = current_z + (self.layer_parity * self.layer_height * 0.5)
+                    line = f"G1 Z{new_z:.3f} F{self.z_speed} ; SHIFT_APPLIED ({self.layer_parity * self.layer_height * 0.5:.3f}mm)\n"
                     processed.append(line)
                     continue
 
@@ -471,21 +477,17 @@ class GCodeProcessor:
                     x_match = self.re_x.search(line)
                     y_match = self.re_y.search(line)
                     if x_match and y_match:
-                        x = float(x_match.group(1))
-                        y = float(y_match.group(1))
-                        # Only shift inner perimeters
-                        if ptype == PerimeterType.INNER:
-                            x += x_offset
-                            y += x_offset
+                        x = float(x_match.group(1)) + x_offset
+                        y = float(y_match.group(1)) + x_offset  # Shift Y equally
                         line = f"X{x:.3f} Y{y:.3f}"
 
-            # Existing extrusion adjustment
+            # Extrusion adjustment
             if "E" in line:
                 line = self._adjust_extrusion(line, layer_num == total_layers - 1)
+                self.total_extrusion_adjustments += 1  # Track adjustments
 
             processed.append(line)
 
-        # Logging and return (keep existing code)
         self.layer_times.append((datetime.now() - layer_start).total_seconds())
         self.logger.info(
             f"Layer {layer_num+1}: Z-shift={z_shift:.3f}mm, XY-shift={x_offset:.3f}mm"
@@ -521,13 +523,11 @@ class GCodeProcessor:
         e_match = self.re_e.search(line)
         if e_match:
             e_value = float(e_match.group(1))
-            # Scale extrusion for shifted layers
-            scaled_e = e_value * (
-                1 + abs(self.layer_parity * 0.1)
-            )  # +10% for brick layers
+            multiplier = self._get_multiplier(is_last_layer)
+            scaled_e = e_value * multiplier
             return (
                 self.re_e_sub.sub(f"E{scaled_e:.5f}", line).rstrip()
-                + " ; brick layer\n"
+                + f" ; {self._get_comment(is_last_layer)}\n"
             )
         return line
 
