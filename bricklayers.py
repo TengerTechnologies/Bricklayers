@@ -40,12 +40,24 @@ class GCodeProcessor:
         self,
         layer_height=None,
         extrusion_multiplier=1.0,
+        first_layer_multiplier=None,
+        last_layer_multiplier=None,
         min_distance=0.1,
         max_intersection_area=0.5,
         simplify_tolerance=0.03,
         log_level=logging.INFO,
     ):
         self.extrusion_multiplier = extrusion_multiplier
+        self.first_layer_multiplier = (
+            first_layer_multiplier
+            if first_layer_multiplier is not None
+            else 1.5 * extrusion_multiplier
+        )  # Scale base multiplier
+        self.last_layer_multiplier = (
+            last_layer_multiplier
+            if last_layer_multiplier is not None
+            else 0.5 * extrusion_multiplier
+        )
         self.min_distance = min_distance
         self.max_intersection_area = max_intersection_area
         self.simplify_tolerance = simplify_tolerance
@@ -287,10 +299,10 @@ class GCodeProcessor:
             self.total_extrusion_adjustments += 1
             e_value = float(e_match.group(1))
             if self.current_layer == 0:
-                new_e = e_value * 1.5
+                new_e = e_value * self.first_layer_multiplier
                 comment = "first layer"
             elif is_last_layer:
-                new_e = e_value * 0.5
+                new_e = e_value * self.last_layer_multiplier
                 comment = "last layer"
             else:
                 new_e = e_value * self.extrusion_multiplier
@@ -581,12 +593,26 @@ def main():
         default="INFO",
         help="Set logging verbosity level",
     )
+    parser.add_argument(
+        "-firstLayerMultiplier",
+        type=float,
+        default=None,
+        help="Extrusion multiplier for first layer (default: 1.5 × base multiplier)",
+    )
+    parser.add_argument(
+        "-lastLayerMultiplier",
+        type=float,
+        default=None,
+        help="Extrusion multiplier for last layer (default: 0.5 × base multiplier)",
+    )
 
     args = parser.parse_args()
 
     processor = GCodeProcessor(
         log_level=getattr(logging, args.logLevel),
         layer_height=args.layerHeight,
+        first_layer_multiplier=args.firstLayerMultiplier,
+        last_layer_multiplier=args.lastLayerMultiplier,
         extrusion_multiplier=args.extrusionMultiplier,
         simplify_tolerance=args.simplifyTolerance,
     )
