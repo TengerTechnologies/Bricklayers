@@ -83,6 +83,14 @@ class GCodeProcessor:
         self.max_area_deviation = max_area_deviation
         self.hausdorff_multiplier = hausdorff_multiplier
 
+        # Precompile regex patterns for performance
+        self.re_z = re.compile(r"Z([\d.]+)")
+        self.re_f = re.compile(r"F([\d.]+)")
+        self.re_e = re.compile(r"E([\d.]+)")
+        self.re_e_sub = re.compile(r"E[\d.]+")
+        self.re_x = re.compile(r"X([\d.]+)")
+        self.re_y = re.compile(r"Y([\d.]+)")
+
         # Unified logging configuration
         self._configure_logging(log_level)
 
@@ -140,7 +148,7 @@ class GCodeProcessor:
                 for line in iter(mm.readline, b""):
                     decoded_line = decoded_line = self.decode_line(line)
                     if decoded_line.startswith("G1 Z"):
-                        z_match = re.search(r"Z([\d.]+)", decoded_line)
+                        z_match = self.re_z.search(decoded_line)
                         if z_match:
                             z_values.append(float(z_match.group(1)))
 
@@ -188,7 +196,7 @@ class GCodeProcessor:
                 if line.startswith(("G0 ", "G1 ")):
                     # Check for Z moves without X/Y
                     if "Z" in line and "X" not in line and "Y" not in line:
-                        f_match = re.search(r"F([\d.]+)", line)
+                        f_match = self.re_f.search(line)
                         if f_match:
                             try:
                                 speed = float(f_match.group(1))
@@ -257,8 +265,8 @@ class GCodeProcessor:
 
         for line_idx, line in enumerate(layer_lines):
             if line.startswith("G1") and "X" in line and "Y" in line and "E" in line:
-                x_match = re.search(r"X([\d.]+)", line)
-                y_match = re.search(r"Y([\d.]+)", line)
+                x_match = self.re_x.search(line)
+                y_match = self.re_y.search(line)
                 if x_match and y_match:
                     current_path.append(
                         (float(x_match.group(1)), float(y_match.group(1)))
@@ -334,7 +342,7 @@ class GCodeProcessor:
         return perimeter_paths
 
     def _adjust_extrusion(self, line, is_last_layer):
-        e_match = re.search(r"E([\d.]+)", line)
+        e_match = self.re_e.search(line)
         if e_match:
             self.total_extrusion_adjustments += 1
             e_value = float(e_match.group(1))
@@ -347,7 +355,7 @@ class GCodeProcessor:
             else:
                 new_e = e_value * self.extrusion_multiplier
                 comment = "internal perimeter"
-            adjusted = re.sub(r"E[\d.]+", f"E{new_e:.5f}", line).strip()
+            adjusted = self.re_e_sub.sub(f"E{new_e:.5f}", line).strip()
             return f"{adjusted} ; {comment}\n"
         return line
 
@@ -409,19 +417,19 @@ class GCodeProcessor:
 
         # Initial feedrate detection
         for line in layer_lines:
-            if f_match := re.search(r"F([\d.]+)", line):
+            if f_match := self.re_f.search(line):
                 current_f = float(f_match.group(1))
                 break
 
         # Process each line in layer
         for line_idx, line in enumerate(layer_lines):
             # Update current feedrate from line
-            if f_match := re.search(r"F([\d.]+)", line):
+            if f_match := self.re_f.search(line):
                 current_f = float(f_match.group(1))
 
             # Handle Z position updates
             if line.startswith("G1 Z"):
-                if z_match := re.search(r"Z([\d.]+)", line):
+                if z_match := self.re_z.search(line):
                     self.current_z = float(z_match.group(1))
 
             # Internal perimeter processing
