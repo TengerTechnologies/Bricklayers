@@ -110,7 +110,7 @@ class GCodeProcessor:
         self.open_paths = 0
         self.extrusion_mode = "absolute"  # Default assumption
         self.last_e_value = 0.0
-        self.lateral_shift = 0.4  # Fraction of layer width to shift
+        self.lateral_shift = 0.3  # Fraction of layer width to shift
         self.vertical_shift = 0.5  # Fraction of layer height to shift
         self.layer_parity = 1  # Track even/odd layers
 
@@ -471,14 +471,13 @@ class GCodeProcessor:
                     x_match = self.re_x.search(line)
                     y_match = self.re_y.search(line)
                     if x_match and y_match:
-                        x = float(x_match.group(1)) + x_offset
-                        y = float(y_match.group(1)) + x_offset  # Shift Y equally
-                        line = (
-                            line.replace(f"X{x_match.group(1)}", f"X{x:.3f}").replace(
-                                f"Y{y_match.group(1)}", f"Y{y:.3f}"
-                            )
-                            + f" ; SHIFT_APPLIED (X+Y={x_offset:.3f}mm)\n"
-                        )
+                        x = float(x_match.group(1))
+                        y = float(y_match.group(1))
+                        # Only shift inner perimeters
+                        if ptype == PerimeterType.INNER:
+                            x += x_offset
+                            y += x_offset
+                        line = f"X{x:.3f} Y{y:.3f}"
 
             # Existing extrusion adjustment
             if "E" in line:
