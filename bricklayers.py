@@ -146,14 +146,7 @@ class GCodeProcessor:
                 return PrinterType.PRUSA.value
 
     def detect_layer_height(self, file_path):
-        """Calculate vertical resolution through statistical analysis of Z-axis moves.
-
-        Employs median-based detection to reject outlier movements while
-        handling common slicing artifacts:
-        - Prime towers
-        - Layer change sequences
-        - Non-printing movements
-        """
+        """Calculate vertical resolution with robust validation."""
         z_values = []
         with open(file_path, "r") as f:
             with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
@@ -163,9 +156,42 @@ class GCodeProcessor:
                         z_match = re.search(r"Z([\d.]+)", decoded_line)
                         if z_match:
                             z_values.append(float(z_match.group(1)))
-        if len(z_values) < 2:
-            raise ValueError("Not enough Z values to detect layer height.")
-        return median([z_values[i + 1] - z_values[i] for i in range(len(z_values) - 1)])
+
+        # Calculate all positive layer height candidates
+        layer_heights = []
+        for i in range(len(z_values) - 1):
+            delta = z_values[i + 1] - z_values[i]
+            if delta > 0:  # Only consider positive Z movements
+                layer_heights.append(delta)
+
+        # Validation checks
+        if not layer_heights:
+            raise ValueError("No valid positive Z-axis movements detected")
+
+        if len(set(round(h, 3) for h in layer_heights)) > 3:
+            self.logger.warning("Multiple different layer heights detected")
+
+        median_height = median(layer_heights)
+
+        # Sanity bounds check (0.04mm - 0.6mm)
+        if not 0.04 <= median_height <= 0.6:
+            raise ValueError(
+                f"Implausible layer height: {median_height:.2f}mm. "
+                "Check Z-axis movements or specify manually with -layerHeight"
+            )
+
+        # Verify reasonable distribution around median
+        within_tolerance = [
+            h
+            for h in layer_heights
+            if 0.95 * median_height <= h <= 1.05 * median_height
+        ]
+        if len(within_tolerance) / len(layer_heights) < 0.8:
+            self.logger.warning(
+                "Inconsistent layer heights detected - verify Z-axis commands"
+            )
+
+        return median_height
 
     def dynamic_simplification_tolerance(self, poly: Polygon) -> float:
         """Adaptive geometry simplification based on feature scale.
