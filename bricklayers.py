@@ -46,6 +46,7 @@ class GCodeProcessor:
         max_intersection_area=0.5,
         simplify_tolerance=0.03,
         log_level=logging.INFO,
+        z_speed=None,
     ):
         self.extrusion_multiplier = extrusion_multiplier
         self.first_layer_multiplier = (
@@ -68,6 +69,7 @@ class GCodeProcessor:
         self.layer_height = layer_height
         self.z_shift = None
         self.shifted_blocks = 0
+        self.z_speed = z_speed
         self.perimeter_found = False
         self.total_z_shifts = 0
         self.total_extrusion_adjustments = 0
@@ -173,6 +175,36 @@ class GCodeProcessor:
             )
 
         return median_height
+
+    def detect_z_speed(self, file_path):
+        z_speeds = []
+        with open(file_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith(("G0 ", "G1 ")):
+                    # Check for Z moves without X/Y
+                    if "Z" in line and "X" not in line and "Y" not in line:
+                        f_match = re.search(r"F([\d.]+)", line)
+                        if f_match:
+                            try:
+                                speed = float(f_match.group(1))
+                                z_speeds.append(speed)
+                                self.logger.debug(f"Found Z move with F{speed}")
+                            except ValueError:
+                                pass
+
+        if z_speeds:
+            detected_speed = median(z_speeds)
+            self.logger.info(
+                f"Detected Z-axis speed: {detected_speed} mm/min (from {len(z_speeds)} samples)"
+            )
+            return detected_speed
+        else:
+            default_speed = 300.0  # 300 mm/min = 5 mm/s
+            self.logger.warning(
+                f"No Z-axis speeds detected, using default {default_speed} mm/min"
+            )
+            return default_speed
 
     def dynamic_simplification_tolerance(self, poly: Polygon) -> float:
         bounds = poly.bounds
@@ -458,6 +490,11 @@ class GCodeProcessor:
                 self.layer_height = self.detect_layer_height(input_path)
 
             self.z_shift = self.layer_height * 0.5
+
+            if self.z_speed is None:
+                self.z_speed = self.detect_z_speed(input_path)
+            self.logger.info(f"Z-axis move speed: {self.z_speed} mm/min")
+
             self.logger.info(
                 f"Layer height: {self.layer_height:.2f}mm | Z-shift: {self.z_shift:.2f}mm"
             )
@@ -605,6 +642,12 @@ def main():
         default=None,
         help="Extrusion multiplier for last layer (default: 0.5 × base multiplier)",
     )
+    parser.add_argument(
+        "-zSpeed",
+        type=float,
+        default=None,
+        help="Manual Z-axis move speed in mm/min (default: auto-detect from G-code)",
+    )
 
     args = parser.parse_args()
 
@@ -615,6 +658,7 @@ def main():
         last_layer_multiplier=args.lastLayerMultiplier,
         extrusion_multiplier=args.extrusionMultiplier,
         simplify_tolerance=args.simplifyTolerance,
+        z_speed=args.zSpeed,
     )
     processor.process_gcode(args.input_file, args.bgcode)
 
