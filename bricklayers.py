@@ -321,8 +321,16 @@ class GCodeProcessor:
 
                         # Create and validate polygon
                         poly = make_valid(Polygon(current_path))
+                        if not isinstance(poly, Polygon):
+                            raise ValueError(
+                                f"Resulting geometry is {poly.geom_type}, expected Polygon"
+                            )
                         if not poly.is_valid:
                             raise ValueError("Invalid geometry after make_valid")
+                        if poly.area <= 0.0:
+                            raise ValueError(
+                                f"Polygon has non-positive area: {poly.area}"
+                            )
 
                         # Store with classification
                         perimeter_paths.append(
@@ -444,7 +452,7 @@ class GCodeProcessor:
         # Modified area validation with relative comparison
         outer_areas = [p.area for p, _ in classified["outer"]]
         inner_areas = [p.area for p, _ in classified["inner"]]
-        
+
         if outer_areas and inner_areas:
             for i, inner_area in enumerate(inner_areas):
                 closest_outer = min(outer_areas, key=lambda x: abs(x - inner_area))
@@ -458,12 +466,12 @@ class GCodeProcessor:
         if classified["outer"] and classified["inner"]:
             outer_polys = [p for p, _ in classified["outer"]]
             tree = STRtree(outer_polys)
-            
+
             for inner_poly, _ in classified["inner"]:
                 # Find nearest outer polygon instead of checking all
                 nearest_outer_idx = tree.nearest(inner_poly)
                 nearest_outer = outer_polys[nearest_outer_idx]
-                
+
                 if not nearest_outer.contains(inner_poly):
                     self.logger.debug(
                         "Outer perimeter doesn't contain nearest inner - "
