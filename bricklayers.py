@@ -63,9 +63,20 @@ class GCodeProcessor:
         self.layer_times = []
         self.simplified_features = 0
         self.failed_simplifications = 0
+        self.decoding_errors = 0
 
         # Unified logging configuration
         self._configure_logging(log_level)
+        
+    def decode_line(self, line_bytes):
+        try:
+            return line_bytes.decode("utf-8")
+        except UnicodeDecodeError as e:
+            self.decoding_errors += 1
+            self.logger.warning(
+                f"Encoding error in line (replaced invalid bytes): {str(e)}"
+            )
+            return line_bytes.decode("utf-8", errors="replace")
 
     def _configure_logging(self, log_level):
         self.logger = logging.getLogger("Bricklayers")
@@ -97,7 +108,7 @@ class GCodeProcessor:
         with open(file_path, "r") as f:
             with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
                 for line in iter(mm.readline, b""):
-                    decoded_line = line.decode("utf-8", errors="ignore")
+                    decoded_line = decoded_line = self.decode_line(line)
                     if "; FEATURE:" in decoded_line:
                         return PrinterType.BAMBU.value
                     if ";TYPE:" in decoded_line:
@@ -109,7 +120,7 @@ class GCodeProcessor:
         with open(file_path, "r") as f:
             with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
                 for line in iter(mm.readline, b""):
-                    decoded_line = line.decode("utf-8", errors="ignore")
+                    decoded_line = decoded_line = self.decode_line(line)
                     if decoded_line.startswith("G1 Z"):
                         z_match = re.search(r"Z([\d.]+)", decoded_line)
                         if z_match:
@@ -454,7 +465,7 @@ class GCodeProcessor:
 
                         self.logger.info("Begin layer processing...")
                         for line in iter(mm.readline, b""):
-                            decoded_line = line.decode("utf-8", errors="ignore")
+                            decoded_line = decoded_line = self.decode_line(line)
                             layer_buffer.append(decoded_line)
 
                             if (
@@ -489,6 +500,7 @@ class GCodeProcessor:
             self.logger.info(
                 "════════════════════ Processing Complete ════════════════════\n"
                 f"Total Layers Processed: {self.total_layers}\n"
+                f"Total Decoding Errors: {self.decoding_errors}\n"
                 f"Total Z-Shifts Applied: {self.shifted_blocks}\n"
                 f"Extrusion Adjustments: {self.total_extrusion_adjustments}\n"
                 f"Simplified Features: {self.simplify_success_count}\n"
