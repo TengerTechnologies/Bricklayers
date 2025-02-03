@@ -495,18 +495,30 @@ class GCodeProcessor:
     def _adjust_extrusion(self, line, is_last_layer):
         e_match = self.re_e.search(line)
         if e_match:
-            e_value = float(e_match.group(1))
-            if self.current_layer == 0:
-                new_e = e_value * self.first_layer_multiplier
-                comment = "first layer"
-            elif is_last_layer:
-                new_e = e_value * self.last_layer_multiplier
-                comment = "last layer"
+            new_e_str = e_match.group(1)
+            new_e = float(new_e_str)
+
+            # Apply multiplier based on extrusion mode
+            if self.extrusion_mode == "relative":
+                adjusted_e = new_e * self._get_multiplier(is_last_layer)
             else:
-                new_e = e_value * self.extrusion_multiplier
-                comment = "adjusted extrusion"
-            self.total_extrusion_adjustments += 1
-            return self.re_e_sub.sub(f"E{new_e:.5f}", line).rstrip() + f" ; {comment}\n"
+                # Absolute mode: calculate delta and scale
+                delta_e = new_e - self.last_e_absolute
+                adjusted_e = self.last_e_absolute + (
+                    delta_e * self._get_multiplier(is_last_layer)
+                )
+                self.last_e_absolute = adjusted_e
+
+            # Format with 5 decimals to match slicer conventions
+            formatted_e = (
+                f"{adjusted_e:.5f}".rstrip("0").rstrip(".")
+                if "." in f"{adjusted_e:.5f}"
+                else f"{adjusted_e:.5f}"
+            )
+            return (
+                self.re_e.sub(f"E{formatted_e}", line)
+                + f" ; {self._get_comment(is_last_layer)}\n"
+            )
         return line
 
     def process_gcode(self, input_file, is_bgcode=False):
