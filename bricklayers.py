@@ -593,113 +593,35 @@ class GCodeProcessor:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Adaptive G-code Optimizer for Structural Printing"
+        description='Adaptive G-code Optimizer Leveraging "Bricklayers" for Structural Printing'
     )
-    parser.add_argument("input_file", help="Input G-code file path")
+    parser.add_argument("inputFile", help="Input G-code file path")
     parser.add_argument("-layerHeight", type=float, help="Manual layer height override")
+    parser.add_argument("-extrusionMultiplier", type=float, default=1.0, help="...")
+    parser.add_argument("-simplifyTolerance", type=float, default=0.03, help="...")
+    parser.add_argument("-bgcode", action="store_true", help="...")
     parser.add_argument(
-        "-extrusionMultiplier",
-        type=float,
-        default=1.0,
-        help="Extrusion multiplier for internal perimeters",
+        "--logLevel", choices=["DEBUG", ...], default="INFO", help="..."
     )
+    parser.add_argument("-firstLayerMultiplier", type=float, default=None, help="...")
+    parser.add_argument("-lastLayerMultiplier", type=float, default=None, help="...")
+    parser.add_argument("-zSpeed", type=float, default=None, help="...")
+    parser.add_argument("-maxAreaDev", type=float, default=0.06, help="...")
+    parser.add_argument("-hausdorffMult", type=float, default=0.3, help="...")
+    parser.add_argument("-maxZSpeed", type=float, default=6000.0, help="...")
+    parser.add_argument("-minZMoveTime", type=float, default=0.5, help="...")
+    parser.add_argument("-safeZDistance", type=float, default=1.0, help="...")
     parser.add_argument(
-        "-simplifyTolerance",
-        type=float,
-        default=0.03,
-        help="Base simplification tolerance (mm)",
-    )
-    parser.add_argument(
-        "-bgcode", action="store_true", help="Enable for binary G-code processing"
-    )
-    parser.add_argument(
-        "--logLevel",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-        default="INFO",
-        help="Set logging verbosity level",
-    )
-    parser.add_argument(
-        "-firstLayerMultiplier",
-        type=float,
-        default=None,
-        help="First layer extrusion multiplier",
-    )
-    parser.add_argument(
-        "-lastLayerMultiplier",
-        type=float,
-        default=None,
-        help="Last layer extrusion multiplier",
-    )
-    parser.add_argument(
-        "-zSpeed", type=float, default=None, help="Manual Z-axis move speed"
-    )
-    parser.add_argument(
-        "-maxAreaDev",
-        type=float,
-        default=0.06,
-        help="Max allowed geometry deviation (default: %(default).3f)",
-    )
-    parser.add_argument(
-        "-hausdorffMult",
-        type=float,
-        default=0.3,
-        help="Simplification aggressiveness (default: %(default).2f)",
-    )
-    parser.add_argument(
-        "-maxZSpeed",
-        type=float,
-        default=6000.0,
-        help="Maximum allowable Z-axis speed",
-    )
-    parser.add_argument(
-        "-minZMoveTime",
-        type=float,
-        default=0.5,
-        help="Minimum time for small Z moves",
-    )
-    parser.add_argument(
-        "-safeZDistance",
-        type=float,
-        default=1.0,
-        help="Z distance threshold for speed adjustment",
-    )
-    parser.add_argument(
-        "--per-perimeter-shifts",
+        "--perPerimeterShifts",
         action="store_false",
-        dest="full_layer_shifts",
+        dest="fullLayerShifts",
         default=True,
-        help="Use per-perimeter Z-shifts",
+        help="...",
     )
-    parser.add_argument(
-        "-minDetail",
-        type=float,
-        default=0.2,
-        help="Minimum preserved feature size in mm (default: %(default).2f)",
-    )
-    parser.add_argument(
-        "-criticalAngle",
-        type=float,
-        default=25,
-        help="Preserve angles sharper than this (degrees)",
-    )
-    parser.add_argument(
-        "-precision",
-        choices=["auto", "high_precision", "balanced", "draft", "disabled"],
-        default="auto",
-        help=(
-            "Processing mode:\n"
-            "auto: Adapt based on model characteristics\n"
-            "high_precision: Maximum feature preservation\n"
-            "balanced: Optimized quality/speed\n"
-            "draft: Faster processing"
-        ),
-    )
-    parser.add_argument(
-        "-min_perimeter_points",
-        type=int,
-        default=3,  # Changed from 4
-        help="Minimum points for valid perimeter (default: %(default)d)",
-    )
+    parser.add_argument("-minDetail", type=float, default=0.2, help="...")
+    parser.add_argument("-criticalAngle", type=float, default=25, help="...")
+    parser.add_argument("-precision", choices=["auto", ...], default="auto", help="...")
+    parser.add_argument("-minPerimeterPoints", type=int, default=3, help="...")
 
     args = parser.parse_args()
 
@@ -716,12 +638,13 @@ def main():
         max_z_speed=args.maxZSpeed,
         min_z_move_time=args.minZMoveTime,
         safe_z_distance=args.safeZDistance,
-        full_layer_shifts=args.full_layer_shifts,
+        full_layer_shifts=args.fullLayerShifts,
         min_feature_size=args.minDetail,
         critical_angle=args.criticalAngle,
         precision_mode=args.precision,
+        min_perimeter_points=args.minPerimeterPoints,
     )
-    processor.process_gcode(args.input_file, args.bgcode)
+    processor.process_gcode(args.inputFile, args.bgcode)
 
 
 if __name__ == "__main__":
