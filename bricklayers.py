@@ -30,11 +30,6 @@ import logging.handlers
 
 
 class PrinterType(Enum):
-    """Enumeration of supported 3D printer manufacturers.
-
-    Provides compatibility with different slicer dialects while maintaining
-    strict G-code interpretation standards for mission-critical applications.
-    """
 
     BAMBU = "bambu"  # Bambu Lab Studio slicer identification
     PRUSA = "prusa"  # PrusaSlicer/G-code dialect identification
@@ -50,16 +45,6 @@ class GCodeProcessor:
         simplify_tolerance=0.03,
         log_level=logging.INFO,
     ):
-        """High-reliability G-code processor for manufacturing applications.
-
-        Args:
-            layer_height: Manual override when auto-detection insufficient (mm)
-            extrusion_multiplier: Material flow calibration factor (1.0 = nominal)
-            min_distance: Minimum recognized feature size (mm)
-            max_intersection_area: Maximum allowable simplification-induced voids (mm²)
-            simplify_tolerance: Base geometric simplification threshold (mm)
-            log_level: Audit trail verbosity (DEBUG < INFO < WARNING < ERROR)
-        """
         self.extrusion_multiplier = extrusion_multiplier
         self.min_distance = min_distance
         self.max_intersection_area = max_intersection_area
@@ -83,7 +68,6 @@ class GCodeProcessor:
         self._configure_logging(log_level)
 
     def _configure_logging(self, log_level):
-        """Centralized logging with rotation and timestamped files."""
         self.logger = logging.getLogger("Bricklayers")
         self.logger.setLevel(log_level)
 
@@ -110,11 +94,6 @@ class GCodeProcessor:
             self.logger.addHandler(console_handler)
 
     def detect_printer_type(self, file_path):
-        """Identify slicer dialect from G-code metadata patterns.
-
-        Uses memory-mapped I/O for efficient large file processing while
-        maintaining compatibility with major slicer feature markers.
-        """
         with open(file_path, "r") as f:
             with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
                 for line in iter(mm.readline, b""):
@@ -126,7 +105,6 @@ class GCodeProcessor:
                 return PrinterType.PRUSA.value
 
     def detect_layer_height(self, file_path):
-        """Calculate vertical resolution with robust validation."""
         z_values = []
         with open(file_path, "r") as f:
             with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
@@ -174,30 +152,18 @@ class GCodeProcessor:
         return median_height
 
     def dynamic_simplification_tolerance(self, poly: Polygon) -> float:
-        """Adaptive geometry simplification based on feature scale.
-
-        Implements non-linear tolerance scaling to preserve small critical
-        features while optimizing large continuous areas:
-        - Minimum: User-defined baseline tolerance
-        - Scaling: 10% of smallest feature dimension
-        """
         bounds = poly.bounds
-        min_dimension = min(
-            bounds[2] - bounds[0], bounds[3] - bounds[1]  # Width
-        )  # Height
-
-        # Use 10% of feature size but never less than user-specified minimum
+        width = bounds[2] - bounds[0]
+        height = bounds[3] - bounds[1]
+        
+        # Handle degenerate geometries with zero/negative dimensions
+        if width <= 0.0 or height <= 0.0:
+            return self.simplify_tolerance
+            
+        min_dimension = min(width, height)
         return max(self.simplify_tolerance, min_dimension * 0.1)
 
     def validate_simplification(self, original: Polygon, simplified: Polygon) -> bool:
-        """Quality control check for simplified geometries.
-
-        Implements three-stage validation protocol:
-        1. Topological integrity check
-        2. Area deviation threshold (<2%)
-        3. Hausdorff distance threshold (<15% of feature size)
-        4. Minimum vertex count enforcement
-        """
         if not simplified.is_valid:
             return False
 
@@ -218,13 +184,6 @@ class GCodeProcessor:
         )
 
     def parse_perimeter_paths(self, layer_lines):
-        """Convert G-code movements to topologically valid polygons.
-
-        Implements robust path handling:
-        - Automatic path closure for non-manifold geometries
-        - Adaptive geometry simplification
-        - Validation-aware processing with error containment
-        """
         perimeter_paths = []
         current_path = []
         current_lines = []
@@ -312,13 +271,6 @@ class GCodeProcessor:
         return perimeter_paths
 
     def _adjust_extrusion(self, line, is_last_layer):
-        """Precision extrusion calibration with context-aware adjustments.
-
-        Implements layer-type specific flow compensation:
-        - First layer: 150% flow for adhesion
-        - Last layer: 50% flow for surface finish
-        - Internal perimeters: User-defined multiplier
-        """
         e_match = re.search(r"E([\d.]+)", line)
         if e_match:
             self.total_extrusion_adjustments += 1
@@ -337,11 +289,6 @@ class GCodeProcessor:
         return line
 
     def classify_perimeters(self, perimeter_paths):
-        """Spatial analysis for perimeter containment relationships.
-
-        Utilizes STRtree spatial indexing for O(log n) containment checks
-        in complex geometries with nested features.
-        """
         if not perimeter_paths:
             return [], []
 
@@ -361,7 +308,6 @@ class GCodeProcessor:
         return outer, inner
 
     def process_layer(self, layer_lines, layer_num, total_layers):
-        """Process a single G-code layer with feedrate-aware Z-shifting."""
         layer_start = datetime.now()
 
         # Analyze perimeter geometry
@@ -452,7 +398,6 @@ class GCodeProcessor:
         return processed
 
     def process_gcode(self, input_file, is_bgcode=False):
-        """Execute full G-code processing pipeline with dual logging."""
         self.processing_start = datetime.now()
         script_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -562,16 +507,6 @@ class GCodeProcessor:
         return input_path
 
     def get_memory_usage(self):
-        """Monitor process memory consumption for stability management.
-
-        Returns:
-            float: Resident Set Size in megabytes (0.0 if psutil unavailable)
-
-        Reliability Notes:
-            - Gracefully degrades when psutil not installed
-            - Handles memory tracking failures without process interruption
-            - Provides insight for large-file memory budgeting
-        """
         try:
             import psutil
 
@@ -585,22 +520,6 @@ class GCodeProcessor:
 
 
 def main():
-    """Configure and execute G-code optimization from command interface.
-
-    System Requirements:
-        - Python 3.9+ (type hinting and performance features)
-        - 2x input file size free memory (for in-place processing)
-
-    Critical Arguments:
-        --logLevel: Sets verbosity (DEBUG for forensic analysis)
-        -simplifyTolerance: Base simplification in mm (0.03=pretty precise, set to 0 to turn off)
-        -bgcode: Enable for encrypted Prusa firmware formats
-
-    Audit Controls:
-        - Timestamped log files with rotation
-        - Checksum verification on binary G-code
-        - Complete runtime instrumentation
-    """
     parser = argparse.ArgumentParser(
         description="Advanced G-code processor for 3D printing optimization"
     )
