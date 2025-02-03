@@ -63,6 +63,7 @@ class GCodeProcessor:
         min_feature_size=0.2,  # More practical default
         critical_angle=25,
         precision_mode="auto",
+        lateral_shift_ratio=0.25,  # 25% of layer width
     ):
         self.extrusion_multiplier = extrusion_multiplier
         self.first_layer_multiplier = (
@@ -110,9 +111,8 @@ class GCodeProcessor:
         self.open_paths = 0
         self.extrusion_mode = "absolute"  # Default assumption
         self.last_e_value = 0.0
-        self.lateral_shift = 0.3  # Fraction of layer width to shift
-        self.vertical_shift = 0.5  # Fraction of layer height to shift
-        self.layer_parity = 1  # Track even/odd layers
+        self.lateral_shift_ratio = lateral_shift_ratio
+        self.layer_parity = 1  # Start with positive shift
         self.actual_z = 0.0  # Track printed Z
         self.current_z = 0.0  # 👈 Track actual printed Z
 
@@ -121,10 +121,18 @@ class GCodeProcessor:
         self.re_f = re.compile(r"F([\d.]+)")
         self.re_e = re.compile(r"E([\d.]+)")
         self.re_e_sub = re.compile(r"E[\d.]+")
-        self.re_x = re.compile(r"X([\d.]+)")
-        self.re_y = re.compile(r"Y([\d.]+)")
+        # Capture both full and decimal-first numbers
+        self.re_x = re.compile(r"X(-?\d*\.?\d+)")
+        self.re_y = re.compile(r"Y(-?\d*\.?\d+)")
 
         self._configure_logging(log_level)
+
+    def shift_coordinate(match, shift):
+        try:
+            val = float(match.group(1))
+            return f"{match.group(0)[0]}{val + shift:.5f}"
+        except:
+            return match.group(0)
 
     def is_path_closed(self, path):
         if len(path) < 2:
@@ -444,56 +452,86 @@ class GCodeProcessor:
 
     def process_layer(self, layer_lines, layer_num, total_layers):
         layer_start = datetime.now()
-        perimeter_paths = self.parse_perimeter_paths(layer_lines)
-        outer, inner = self.classify_perimeters(perimeter_paths)
-
-        # Determine shift direction for brick pattern
-        self.layer_parity = 1 if layer_num % 2 == 0 else -1
-        x_offset = self.layer_height * self.lateral_shift * self.layer_parity
-        shift_amount = self.layer_parity * self.layer_height * 0.5
-
-        # Track shifted layers
-        self.shifted_blocks += 1
-        self.layer_shift_pattern.append(1)
-
         processed = []
-        z_shift_applied = False  # Track if we've processed the Z shift
-        layer_z = None  # Track this layer's Z
+        z_shift_applied = False
 
-        for line in layer_lines:
+        # Geometric analysis with Shapely
+        perimeter_paths = self.parse_perimeter_paths(layer_lines)
+        outer_perimeters, inner_perimeters = self.classify_perimeters(perimeter_paths)
+        perimeter_lines = {
+            line for _, lines in outer_perimeters + inner_perimeters for line in lines
+        }
+
+        # Calculate shifts
+        self.layer_parity = 1 if (layer_num % 2) == 0 else -1
+        z_shift = self.layer_parity * self.layer_height * 0.5
+        xy_shift = round(
+            self.layer_parity * self.layer_height * self.lateral_shift_ratio, 5
+        )
+
+        for line_idx, line in enumerate(layer_lines):
+            original_line = line
+
+            # Apply Z-shift
             if not z_shift_applied and line.startswith("G1 Z"):
-                z_match = self.re_z.search(line)
-                if z_match:
-                    # Calculate new Z based on prior layer's actual Z
-                    self.current_z += self.layer_height  # 👈 Progress layer height
-                    shift_amount = self.layer_parity * self.layer_height * 0.5
-                    layer_z = self.current_z + shift_amount
-                    line = f"G1 Z{layer_z:.3f} F{self.z_speed} ; SHIFT_APPLIED ({shift_amount:.3f}mm)\n"
+                if z_match := self.re_z.search(line):
+                    original_z = float(z_match.group(1))
+                    new_z = original_z + z_shift
+                    self.current_z = new_z
+                    modified_z_line = f"G1 Z{new_z:.3f} F{self.z_speed} ; SHIFT_APPLIED {z_shift:+.3f}mm\n"
+                    self.logger.debug(f"Z-Shift Original: {line.strip()}")
+                    self.logger.debug(f"Z-Shift Modified: {modified_z_line.strip()}")
+                    line = modified_z_line
                     z_shift_applied = True
 
-            # Apply lateral X/Y shifts to perimeters
-            if any(marker in line for marker in [";TYPE:", "; FEATURE:"]):
-                if "X" in line and "Y" in line:
-                    x_match = self.re_x.search(line)
-                    y_match = self.re_y.search(line)
-                    if x_match and y_match:
-                        x = float(x_match.group(1)) + x_offset
-                        y = float(y_match.group(1)) + x_offset  # Shift Y equally
-                        line = f"X{x:.3f} Y{y:.3f}"
+            # Hybrid detection: Geometric + slicer markers
+            is_perimeter_line = line_idx in perimeter_lines
+            if any(
+                line.strip().startswith(marker) for marker in [";TYPE:", "; FEATURE:"]
+            ):
+                is_perimeter_line = True
 
-            # Extrusion adjustment
-            if "E" in line:
+            # Apply and log XY shifts
+            if is_perimeter_line and ("X" in line or "Y" in line):
+                original_xy = line.strip()
+                # Apply X shift
+                line = re.sub(
+                    self.re_x, lambda m: f"X{float(m.group(1)) + xy_shift:.5f}", line
+                )
+                # Apply Y shift
+                line = re.sub(
+                    self.re_y, lambda m: f"Y{float(m.group(1)) + xy_shift:.5f}", line
+                )
+                modified_xy = line.strip()
+
+                if modified_xy != original_xy:
+                    self.logger.debug("-" * 40)
+                    self.logger.debug(
+                        f"XY-Shift Layer {layer_num+1} Parity {self.layer_parity}"
+                    )
+                    self.logger.debug(f"Original: {original_xy}")
+                    self.logger.debug(f"Modified: {modified_xy}")
+                    self.logger.debug(f"Shift Values: X{xy_shift:.5f} Y{xy_shift:.5f}")
+
+            # Extrusion adjustments
+            if re.search(r"\bE[0-9]", line):
+                original_e = line.strip()
                 line = self._adjust_extrusion(line, layer_num == total_layers - 1)
+                if line.strip() != original_e:
+                    self.logger.debug(f"E-Adjust Original: {original_e}")
+                    self.logger.debug(f"E-Adjust Modified: {line.strip()}")
                 self.total_extrusion_adjustments += 1
 
             processed.append(line)
 
-        if layer_z is not None:
-            self.current_z = layer_z  # 👈 Update for next layer
+        # Logging
         self.layer_times.append((datetime.now() - layer_start).total_seconds())
         self.logger.info(
-            f"Layer {layer_num+1}: Z-shift={shift_amount:.3f}mm, XY-shift={x_offset:.3f}mm"
+            f"Layer {layer_num+1}: Z={self.current_z:.3f} | "
+            f"Shift={z_shift:.3f}mm | XY-Offset={xy_shift:.3f}mm | "
+            f"Paths={len(perimeter_paths)}"
         )
+
         return processed
 
     def _get_current_precision_mode(self):
