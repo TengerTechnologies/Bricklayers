@@ -355,75 +355,93 @@ class GCodeProcessor:
         return outer, inner
 
     def process_layer(self, layer_lines, layer_num, total_layers):
-        """Process a single G-code layer with geometric validation and modifications.
-
-        Performs critical path analysis, perimeter classification, and applies
-        structural reinforcements while maintaining original dimensional accuracy.
-
-        Args:
-            layer_lines: List of raw G-code strings for the current layer
-            layer_num: Zero-indexed layer number being processed
-            total_layers: Total number of layers in the print for progress tracking
-
-        Returns:
-            list: Modified G-code lines with optimizations applied
-
-        Implementation Notes:
-            - Uses spatial indexing for O(log n) containment checks
-            - Alternating Z-shifts maintain mechanical properties
-            - Layer-time tracking enables adaptive future optimizations
-        """
+        """Process a single G-code layer with feedrate-aware Z-shifting."""
         layer_start = datetime.now()
 
-        # Initialize variables first
-        self.current_layer = layer_num
+        # Analyze perimeter geometry
         perimeter_paths = self.parse_perimeter_paths(layer_lines)
         outer_perimeters, inner_perimeters = self.classify_perimeters(perimeter_paths)
 
+        # Track line indices of internal perimeters
         internal_lines = set()
-        for _, lines in inner_perimeters:
-            internal_lines.update(lines)
+        for _, line_indices in inner_perimeters:
+            internal_lines.update(line_indices)
 
+        # Processing state
         processed = []
-        current_block = 0  # Initialize here
+        current_block = 0
         in_internal = False
+        current_f = None  # Tracks current feedrate
+        original_f = None  # Stores pre-shift feedrate
+        z_speed = 300  # Z-axis move speed (300mm/min = 5mm/s)
 
-        # Process lines
+        # Initial feedrate detection
+        for line in layer_lines:
+            if f_match := re.search(r"F([\d.]+)", line):
+                current_f = float(f_match.group(1))
+                break
+
+        # Process each line in layer
         for line_idx, line in enumerate(layer_lines):
+            # Update current feedrate from line
+            if f_match := re.search(r"F([\d.]+)", line):
+                current_f = float(f_match.group(1))
+
+            # Handle Z position updates
             if line.startswith("G1 Z"):
-                z_match = re.search(r"Z([\d.]+)", line)
-                if z_match:
+                if z_match := re.search(r"Z([\d.]+)", line):
                     self.current_z = float(z_match.group(1))
 
+            # Internal perimeter processing
             if line_idx in internal_lines:
                 if not in_internal:
+                    # Start of internal perimeter block
                     current_block += 1
+                    original_f = current_f  # Capture pre-shift feedrate
                     z_shift = self.layer_height * 0.5 if current_block % 2 else 0
+
+                    # Insert Z-shift with isolated Z-speed
                     processed.append(
-                        f"G1 Z{self.current_z + z_shift:.3f} F1200 ; Z-shift block {current_block}\n"
+                        f"G1 Z{self.current_z + z_shift:.3f} F{z_speed} ; Z-shift block {current_block}\n"
                     )
+
+                    # Restore original XY feedrate
+                    if original_f is not None:
+                        processed.append(f"G1 F{original_f:.1f} ; Restore feedrate\n")
+                    else:
+                        self.logger.warning(
+                            f"No feedrate captured before Z-shift at layer {layer_num}"
+                        )
+
                     in_internal = True
                     self.shifted_blocks += 1
+
+                # Apply extrusion adjustments
                 processed.append(
                     self._adjust_extrusion(line, layer_num == total_layers - 1)
                 )
             else:
                 if in_internal:
-                    processed.append(f"G1 Z{self.current_z:.3f} F1200 ; Reset Z\n")
+                    # End of internal perimeter block
+                    processed.append(
+                        f"G1 Z{self.current_z:.3f} F{z_speed} ; Reset Z position\n"
+                    )
+
+                    # Restore current feedrate at block exit
+                    if current_f is not None:
+                        processed.append(
+                            f"G1 F{current_f:.1f} ; Resume outer feedrate\n"
+                        )
+
                     in_internal = False
                 processed.append(line)
 
-        # Move logging to AFTER processing
-        self.logger.info(
-            f"Layer {layer_num+1} complete. "
-            f"Shifted blocks: {current_block} | "
-            f"Internal lines: {len(internal_lines)} | "
-            f"Processing time: {(datetime.now()-layer_start).total_seconds() * 1000:.2f}ms"  # Changed to ms
-        )
+        # Performance logging
         self.layer_times.append((datetime.now() - layer_start).total_seconds())
-
-        self.logger.debug(f"Internal lines: {len(internal_lines)}")
-        self.logger.debug(f"Shifted blocks: {current_block} in this layer")
+        self.logger.info(
+            f"Layer {layer_num+1}: Shifted {current_block} blocks | "
+            f"Feedrate preservation: {original_f or 'default'}"
+        )
 
         return processed
 
