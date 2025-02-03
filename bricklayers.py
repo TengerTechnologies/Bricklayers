@@ -85,6 +85,8 @@ class GCodeProcessor:
         self.printer_type = None
         self.layer_height = layer_height
         self.z_shift = None
+        self.xy_shift_x = None
+        self.xy_shift_y = None
         self.shifted_blocks = 0
         self.z_speed = z_speed
         self.total_extrusion_adjustments = 0
@@ -496,7 +498,7 @@ class GCodeProcessor:
                 is_perimeter_line = True
 
             # Apply cyclic XY shifts
-            if is_perimeter_line and ("X" in line or "Y" in line) and not is_top_layer:
+            if is_perimeter_line and ("X" in line or "Y" in line):
                 original_xy = line.strip()
                 line = re.sub(
                     self.re_x, lambda m: f"X{float(m.group(1)) + xy_shift_x:.5f}", line
@@ -528,7 +530,7 @@ class GCodeProcessor:
         self.layer_times.append((datetime.now() - layer_start).total_seconds())
         self.logger.info(
             f"Layer {layer_num+1}: Z={self.current_z:.3f} | "
-            f"Shift={z_shift:.3f}mm | XY-Offset={xy_shift:.3f}mm | "
+            f"Shift={z_shift:.3f}mm | X-Offset={xy_shift_x:.3f}mm | Y-Offset={xy_shift_y:.3f}mm |"
             f"Paths={len(perimeter_paths)}"
         )
 
