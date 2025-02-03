@@ -35,6 +35,12 @@ class PrinterType(Enum):
     PRUSA = "prusa"  # PrusaSlicer/G-code dialect identification
 
 
+class PerimeterType(Enum):
+    OUTER = "outer"
+    INNER = "inner"
+    SOLID = "solid"
+
+
 class GCodeProcessor:
     def __init__(
         self,
@@ -51,7 +57,8 @@ class GCodeProcessor:
         hausdorff_multiplier=0.15,
         max_z_speed=300.0,
         min_z_move_time=0.5,
-        safe_z_distance=1.0
+        safe_z_distance=1.0,
+        min_perimeter_points=4,
     ):
         self.extrusion_multiplier = extrusion_multiplier
         self.first_layer_multiplier = (
@@ -81,6 +88,7 @@ class GCodeProcessor:
         self.processing_start = None
         self.layer_times = []
         self.simplified_features = 0
+        self.simplify_success_count = 0
         self.failed_simplifications = 0
         self.decoding_errors = 0
         self.max_area_deviation = max_area_deviation
@@ -88,6 +96,7 @@ class GCodeProcessor:
         self.max_z_speed = max_z_speed
         self.min_z_move_time = min_z_move_time
         self.safe_z_distance = safe_z_distance
+        self.min_perimeter_points = min_perimeter_points
 
         # Precompile regex patterns
         self.re_z = re.compile(r"Z([\d.]+)")
@@ -96,7 +105,7 @@ class GCodeProcessor:
         self.re_e_sub = re.compile(r"E[\d.]+")
         self.re_x = re.compile(r"X([\d.]+)")
         self.re_y = re.compile(r"Y([\d.]+)")
-        
+
         self._configure_logging(log_level)
 
     def _calculate_z_speed(self, delta_z):
@@ -268,14 +277,26 @@ class GCodeProcessor:
 
     def parse_perimeter_paths(self, layer_lines):
         perimeter_paths = []
+        current_type = None
         current_path = []
         current_lines = []
-        skipped_paths = 0
-        self.simplify_success_count = 0  # Reset counter per layer
-
-        self.logger.debug("Starting perimeter path parsing")
 
         for line_idx, line in enumerate(layer_lines):
+            # First try slicer-specific classification
+            if self.printer_type == PrinterType.BAMBU.value:
+                if "; FEATURE" in line:
+                    if "Inner wall" in line:
+                        current_type = PerimeterType.INNER
+                    elif "Outer wall" in line:
+                        current_type = PerimeterType.OUTER
+            elif self.printer_type == PrinterType.PRUSA.value:
+                if ";TYPE" in line:
+                    if "WALL-OUTER" in line:
+                        current_type = PerimeterType.OUTER
+                    elif "WALL-INNER" in line:
+                        current_type = PerimeterType.INNER
+
+            # Path parsing logic (existing code)
             if line.startswith("G1") and "X" in line and "Y" in line and "E" in line:
                 x_match = self.re_x.search(line)
                 y_match = self.re_y.search(line)
@@ -286,71 +307,42 @@ class GCodeProcessor:
                     current_lines.append(line_idx)
             else:
                 if current_path:
-                    # Close the path if needed
-                    if current_path[0] != current_path[-1]:
-                        current_path.append(current_path[0])
+                    # Enhanced geometry validation
+                    try:
+                        # Close the path if needed
+                        if current_path[0] != current_path[-1]:
+                            current_path.append(current_path[0])
 
-                    valid_path = False
-                    if len(current_path) >= 4:
-                        try:
-                            poly = Polygon(current_path)
-                            original_area = poly.area
+                        # Validate minimum point count
+                        if len(current_path) < self.min_perimeter_points:
+                            raise ValueError(
+                                f"Insufficient points ({len(current_path)})"
+                            )
 
-                            # Apply simplification if enabled
-                            if self.simplify_tolerance > 0:
-                                dynamic_tolerance = (
-                                    self.dynamic_simplification_tolerance(poly)
-                                )
-                                self.logger.debug(
-                                    f"Using adaptive tolerance: {dynamic_tolerance:.3f}mm"
-                                )
+                        # Create and validate polygon
+                        poly = make_valid(Polygon(current_path))
+                        if not poly.is_valid:
+                            raise ValueError("Invalid geometry after make_valid")
 
-                                simplified = poly.simplify(
-                                    dynamic_tolerance,  # Changed from self.simplify_tolerance
-                                    preserve_topology=True,
-                                )
+                        # Store with classification
+                        perimeter_paths.append(
+                            (
+                                poly,
+                                current_lines,
+                                current_type if current_type else None,
+                            )
+                        )
 
-                                simplified = make_valid(simplified)
-
-                                if (
-                                    simplified.is_valid
-                                    and len(simplified.exterior.coords) >= 4
-                                    and self.validate_simplification(poly, simplified)
-                                ):
-                                    self.simplify_success_count += 1
-                                    poly = simplified
-
-                            if poly.is_valid and not poly.is_empty:
-                                perimeter_paths.append((poly, current_lines))
-                                valid_path = True
-                                self.logger.debug(
-                                    f"Added path with {len(current_path)} points → "
-                                    f"Area: {poly.area:.2f}mm²"
-                                )
-
-                        except Exception as e:
-                            self.failed_simplifications += 1
-                            self.logger.debug(f"Validation failed: {str(e)}")
-                            valid_path = False
-
-                    if valid_path:
-                        self.logger.debug(f"Valid path: {len(current_lines)} commands")
-                    else:
-                        skipped_paths += 1
-                        self.logger.debug(
-                            f"Skipped path at line {line_idx} - "
-                            f"Points: {len(current_path)}, "
-                            f"Closed: {current_path[0] == current_path[-1]}"
+                    except Exception as e:
+                        self.failed_simplifications += 1
+                        self.logger.warning(
+                            f"Skipping invalid path at line {line_idx}: {str(e)}"
                         )
 
                     current_path = []
                     current_lines = []
+                    current_type = None
 
-        self.logger.info(
-            f"Layer analysis - Valid: {len(perimeter_paths)}, "
-            f"Skipped: {skipped_paths}, "
-            f"Simplified: {self.simplify_success_count}"
-        )
         return perimeter_paths
 
     def _adjust_extrusion(self, line, is_last_layer):
@@ -372,40 +364,113 @@ class GCodeProcessor:
         return line
 
     def classify_perimeters(self, perimeter_paths):
-        if not perimeter_paths:
-            return [], []
+        """Classify perimeters using slicer comments when available, falling back to spatial analysis."""
+        classified = {"outer": [], "inner": []}
+        unclassified = []
 
-        polygons, line_indices = zip(*perimeter_paths)
-        tree = STRtree(polygons)
-        inner = []
-        outer = []
+        # First pass: Process comment-classified perimeters
+        for path in perimeter_paths:
+            poly, lines, ptype = path
+            if ptype:
+                if ptype == PerimeterType.OUTER:
+                    classified["outer"].append((poly, lines))
+                    self.logger.debug(
+                        f"Comment-classified outer perimeter with {len(lines)} commands"
+                    )
+                elif ptype == PerimeterType.INNER:
+                    classified["inner"].append((poly, lines))
+                    self.logger.debug(
+                        f"Comment-classified inner perimeter with {len(lines)} commands"
+                    )
+            else:
+                unclassified.append((poly, lines))
 
-        for idx, (poly, lines) in enumerate(perimeter_paths):
-            candidate_idxs = tree.query(poly)
-            candidates = [polygons[i] for i in candidate_idxs if i != idx]
-            is_inner = False
+        # Second pass: Spatial analysis for unclassified
+        if unclassified:
+            self.logger.info(
+                f"Performing spatial analysis on {len(unclassified)} unclassified perimeters"
+            )
+            polygons, line_indices = zip(*unclassified)
+            tree = STRtree(polygons)
 
-            for candidate in candidates:
-                # Only consider candidates larger than current polygon (likely outer)
-                if candidate.area > poly.area:
-                    # Full containment check
-                    if candidate.contains(poly):
-                        is_inner = True
-                        break
-                    # Partial overlap check using max_intersection_area threshold
-                    intersection = candidate.intersection(poly)
-                    if not intersection.is_empty:
-                        overlap_ratio = intersection.area / poly.area
-                        if overlap_ratio > self.max_intersection_area:
+            for idx, (poly, lines) in enumerate(unclassified):
+                is_inner = False
+                candidates = tree.query(poly)
+
+                for candidate_idx in candidates:
+                    if candidate_idx == idx:
+                        continue  # Skip self-comparison
+
+                    candidate = polygons[candidate_idx]
+                    if candidate.area > poly.area:
+                        # Containment check
+                        if candidate.contains(poly):
                             is_inner = True
                             break
 
-            if is_inner:
-                inner.append((poly, lines))
-            else:
-                outer.append((poly, lines))
+                        # Overlap threshold check
+                        intersection = candidate.intersection(poly)
+                        if not intersection.is_empty:
+                            overlap_ratio = intersection.area / poly.area
+                            if overlap_ratio > self.max_intersection_area:
+                                is_inner = True
+                                break
 
-        return outer, inner
+                if is_inner:
+                    classified["inner"].append((poly, lines))
+                    self.logger.debug(
+                        f"Spatial-classified inner perimeter (Area: {poly.area:.2f}mm²)"
+                    )
+                else:
+                    classified["outer"].append((poly, lines))
+                    self.logger.debug(
+                        f"Spatial-classified outer perimeter (Area: {poly.area:.2f}mm²)"
+                    )
+
+        # Validation checks
+        self._validate_classification(classified)
+
+        return classified["outer"], classified["inner"]
+
+    def _validate_classification(self, classified):
+        """Perform sanity checks on classification results."""
+        total_perimeters = len(classified["outer"]) + len(classified["inner"])
+
+        # Check for empty layers
+        if total_perimeters == 0:
+            self.logger.warning("No perimeters found in layer")
+            return
+
+        # Modified area validation with relative comparison
+        outer_areas = [p.area for p, _ in classified["outer"]]
+        inner_areas = [p.area for p, _ in classified["inner"]]
+        
+        if outer_areas and inner_areas:
+            for i, inner_area in enumerate(inner_areas):
+                closest_outer = min(outer_areas, key=lambda x: abs(x - inner_area))
+                if inner_area > closest_outer * 1.1:  # Allow 10% tolerance
+                    self.logger.warning(
+                        f"Potential classification issue: Inner perimeter {i} "
+                        f"({inner_area:.2f}mm²) larger than nearest outer ({closest_outer:.2f}mm²)"
+                    )
+
+        # Modified containment check with spatial index
+        if classified["outer"] and classified["inner"]:
+            outer_polys = [p for p, _ in classified["outer"]]
+            tree = STRtree(outer_polys)
+            
+            for inner_poly, _ in classified["inner"]:
+                # Find nearest outer polygon instead of checking all
+                nearest_outer_idx = tree.nearest(inner_poly)
+                nearest_outer = outer_polys[nearest_outer_idx]
+                
+                if not nearest_outer.contains(inner_poly):
+                    self.logger.debug(
+                        "Outer perimeter doesn't contain nearest inner - "
+                        f"this might be normal for complex geometries "
+                        f"(outer area: {nearest_outer.area:.2f}mm², "
+                        f"inner area: {inner_poly.area:.2f}mm²)"
+                    )
 
     def process_layer(self, layer_lines, layer_num, total_layers):
         layer_start = datetime.now()
@@ -453,7 +518,9 @@ class GCodeProcessor:
                     if original_f is not None:
                         processed.append(f"G1 F{original_f:.1f} ; Restore feedrate\n")
                     else:
-                        self.logger.warning(f"No feedrate captured before Z-shift at layer {layer_num}")
+                        self.logger.warning(
+                            f"No feedrate captured before Z-shift at layer {layer_num}"
+                        )
 
                     in_internal = True
                     self.shifted_blocks += 1
@@ -467,13 +534,15 @@ class GCodeProcessor:
                     z_shift = self.layer_height * 0.5 if (current_block % 2) else 0
                     delta_z = abs(z_shift)
                     dynamic_down_speed = self._calculate_z_speed(delta_z)
-                    
+
                     processed.append(
                         f"G1 Z{self.current_z:.3f} F{dynamic_down_speed} ; Reset Z position\n"
                     )
 
                     if current_f is not None:
-                        processed.append(f"G1 F{current_f:.1f} ; Resume outer feedrate\n")
+                        processed.append(
+                            f"G1 F{current_f:.1f} ; Resume outer feedrate\n"
+                        )
 
                     in_internal = False
                 processed.append(line)
@@ -595,7 +664,7 @@ class GCodeProcessor:
                 f"Total Decoding Errors: {self.decoding_errors}\n"
                 f"Total Z-Shifts Applied: {self.shifted_blocks}\n"
                 f"Extrusion Adjustments: {self.total_extrusion_adjustments}\n"
-                f"Simplified Features: {self.simplify_success_count}\n"
+                f"Simplified Features: {self.simplified_features}\n"
                 f"Failed Simplifications: {self.failed_simplifications}\n"
                 f"Average Layer Time: {sum(self.layer_times)/len(self.layer_times)*1000:.2f}ms\n"
                 f"Total Processing Time: {(datetime.now()-self.processing_start).total_seconds()*1000:.2f}ms\n"
