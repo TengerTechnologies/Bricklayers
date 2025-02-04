@@ -13,10 +13,12 @@
 #
 # Copyright (c) [2025] [Roman Tenger]
 
+# TODO: Figure out why there are vertical layer gaps in support structures and resolve that issue.
+
 from datetime import datetime
 import mmap
 import math
-from shapely.geometry import Polygon, MultiPolygon, LineString
+from shapely.geometry import Polygon, MultiPolygon, LineString, Point
 from shapely.strtree import STRtree
 from shapely.validation import make_valid
 import logging
@@ -41,12 +43,6 @@ class PerimeterType(Enum):
     SOLID = "solid"
 
 
-class FeatureType(Enum):
-    NORMAL = "normal"
-    BRIDGE = "bridge"
-    OVERHANG = "overhang"
-
-
 class GCodeProcessor:
     def __init__(
         self,
@@ -69,7 +65,6 @@ class GCodeProcessor:
         min_feature_size=0.2,  # More practical default
         critical_angle=25,
         precision_mode="auto",
-        nozzle_diameter=0.4,
     ):
         self.extrusion_multiplier = extrusion_multiplier
         self.first_layer_multiplier = (
@@ -114,28 +109,53 @@ class GCodeProcessor:
         self.closure_tolerance = 0.001
         self.travel_threshold = 0.2  # mm
         self.closed_paths = 0
-        self.nozzle_diameter = nozzle_diameter
         self.open_paths = 0
         self.extrusion_mode = "absolute"  # Default assumption
+        self.total_shifts = 0  # New shift counter
         self.last_e_value = 0.0
-        self.layer_parity = 0
-        self.current_z = 0.0  # 👈 Track actual printed Z
-        self.brick_height_layers = 2  # Layers per brick row
-        self.brick_z_shift = (
-            self.layer_height * 0.5
-        )  # Vertical shift between brick rows
-        self.brick_phase = 0  # Track brick rows
+        self.current_z = 0.0  # Track printed Z
+        self.max_mem_usage = 0.0  # Peak memory tracking
+        self.max_model_z = 0.0
+        self.layer_data = []  # Stores (z_height, paths) tuples
+        self.layer_height_source = "user" if layer_height else "auto"
+        self.analysis_results = {
+            "model_vertical_gaps": [],
+            "support_vertical_gaps": [],
+            "horizontal_overlaps": [],
+            "potential_issues": [],
+            "support_layer_indices": set(),
+            "model_layer_indices": set(),
+        }
+        self.overhang_markers = {
+            PrinterType.BAMBU: (";FEATURE:Overhang", ";BRIDGE", ";_BRIDGE"),
+            PrinterType.PRUSA: (
+                ";TYPE:Overhang perimeter",
+                ";_BRIDGE_",
+                ";BRIDGE",
+                ";TYPE:Bridge infill",
+            ),
+        }
 
         # Regex patterns
         self.re_z = re.compile(r"Z([\d.]+)")
         self.re_f = re.compile(r"F([\d.]+)")
         self.re_e = re.compile(r"E([\d.]+)")
-        self.re_e_sub = re.compile(r"E[\d.]+")
-        # Capture both full and decimal-first numbers
-        self.re_x = re.compile(r"X(-?\d*\.?\d+)")
-        self.re_y = re.compile(r"Y(-?\d*\.?\d+)")
+        self.re_e_sub = re.compile(r"E[-+]?\d*\.?\d+([eE][-+]?\d+)?")
+        self.re_x = re.compile(r"X([-+]?\d*\.?\d+([eE][-+]?\d+)?)")
+        self.re_y = re.compile(r"Y([-+]?\d*\.?\d+([eE][-+]?\d+)?)")
 
         self._configure_logging(log_level)
+
+    def _classify_layer_type(self, layer_lines):
+        """Determine if layer contains support material"""
+        for line in layer_lines:
+            if (
+                line.startswith(";TYPE:Support material")
+                or line.startswith(";TYPE:Support material interface")
+                or "support" in line.lower()
+            ):
+                return "support"
+        return "model"
 
     def shift_coordinate(match, shift):
         try:
@@ -144,15 +164,306 @@ class GCodeProcessor:
         except:
             return match.group(0)
 
-    def is_path_closed(self, path):
-        if len(path) < 4:  # Need at least 4 points to form a closed polygon
+    def _identify_perimeter_blocks(self, layer_lines):
+        blocks = []
+        current_block = []
+        current_feature = None
+        feature_markers = {
+            PrinterType.PRUSA: [";TYPE:External perimeter", ";TYPE:Perimeter"],
+            PrinterType.BAMBU: [";FEATURE:Outer wall", ";FEATURE:Inner wall"],
+        }[self.printer_type]
+
+        for line in layer_lines:
+            # Detect feature changes
+            if any(marker in line for marker in feature_markers):
+                if current_block:
+                    blocks.append((current_block, current_feature))
+                    current_block = []
+                current_feature = line.strip()  # Store raw comment
+            elif line.startswith(";") and "TYPE:" in line:
+                # Non-perimeter feature (brim, skirt, etc)
+                if current_block:
+                    blocks.append((current_block, current_feature))
+                    current_block = []
+                current_feature = None
+
+            current_block.append(line)
+
+        if current_block:
+            blocks.append((current_block, current_feature))
+
+        return blocks
+
+    def _process_alternating_blocks(self, layer_lines, current_z):
+        processed = []
+        blocks = self._identify_perimeter_blocks(layer_lines)
+        shift_magnitude = round(self.layer_height * 0.5, 3)  # 0.10mm for 0.20mm
+        non_perim_counter = 0
+        full_shift_details = []
+
+        re_z = re.compile(r"Z(-?\d*\.?\d{1,3})")
+
+        for block, feature_type in blocks:
+            modified_block = []
+            current_z_round = round(current_z, 3)
+            applied_shift = 0.0
+
+            if "support" in str(feature_type).lower():
+                applied_shift = shift_magnitude  # Always apply shift to supports
+            else:
+                applied_shift = shift_magnitude if (non_perim_counter % 2 == 0) else 0.0
+
+            if not self._is_perimeter(feature_type):
+                applied_shift = shift_magnitude if (non_perim_counter % 2 == 0) else 0.0
+                applied_shift = round(applied_shift, 3)
+                non_perim_counter += 1  # Increment after assignment
+
+                for line in block:
+                    if line.startswith("G1") and "Z" in line:
+                        z_match = re_z.search(line)
+                        if z_match:
+                            original_z = round(float(z_match.group(1)), 3)
+                            new_z = round(original_z + applied_shift, 3)
+
+                            if new_z != original_z:
+                                modified = re.sub(re_z, f"Z{new_z:.3f}", line)
+                                full_shift_details.append(
+                                    {
+                                        "feature": feature_type,
+                                        "original": line.strip(),
+                                        "modified": modified.strip(),
+                                        "ΔZ": new_z - original_z,
+                                    }
+                                )
+                                self.total_shifts += 1  # Update counter here
+                            else:
+                                modified = line
+                        else:
+                            modified = line
+
+                        modified_block.append(modified)
+                    else:
+                        modified_block.append(line)
+            else:
+                modified_block = block
+
+            processed.extend(modified_block)
+
+        # Detailed logging
+        if full_shift_details:
+            self.logger.debug(
+                f"Layer {self.current_layer} applied {len(full_shift_details)} shifts"
+            )
+            log_msg = [
+                f"\n── Layer {self.current_layer} (Z={current_z_round:.2f}mm) ──",
+                f"Total Shifts: {len(full_shift_details)}",
+                f"Layer Height: {self.layer_height:.2f}mm ({self.layer_height_source})",
+                "Shift Details:",
+            ]
+
+            for idx, detail in enumerate(full_shift_details, 1):
+                log_msg.append(
+                    f"  Shift {idx}:\n"
+                    f"    Original: {detail['original']}\n"
+                    f"    Modified: {detail['modified']}\n"
+                    f"    ΔZ: {detail['ΔZ']:+.2f}mm"
+                )
+
+            log_msg.append("─" * 40)
+            self.logger.debug("\n".join(log_msg))
+
+        return processed
+
+    def _is_perimeter(self, feature_comment):
+        """Check if a feature comment indicates perimeter OR SUPPORT"""
+        if not feature_comment:
             return False
-        start = path[0]
-        end = path[-1]
-        return (
-            abs(start[0] - end[0]) < self.closure_tolerance
-            and abs(start[1] - end[1]) < self.closure_tolerance
+        return any(
+            p in feature_comment.lower()
+            for p in [
+                "perimeter",
+                "outer wall",
+                "inner wall",
+                "support",
+                "tree",
+                "brim",
+            ]
         )
+
+    def _is_top_layer(self, current_z):
+        """Determine if current layer is in top section using Z-height"""
+        top_threshold = self.max_model_z - (self.layer_height * 3)
+        return current_z >= top_threshold
+
+    def _analyze_layer_bonding(self):
+        """Improved gap detection with buffering"""
+        prev_z = None
+        prev_paths = []
+        prev_type = None
+        prev_layer_idx = 0
+
+        for layer_idx, (z, paths) in enumerate(self.layer_data):
+            current_type = self._classify_layer_type(paths)
+
+            # Store layer type for reporting
+            if current_type == "support":
+                self.analysis_results["support_layer_indices"].add(layer_idx)
+            else:
+                self.analysis_results["model_layer_indices"].add(layer_idx)
+
+            if prev_z is not None:
+                vertical_gap = z - prev_z
+                gap_threshold = self.layer_height * 1.2  # 20% tolerance
+
+                # Only check gaps between same layer types
+                if vertical_gap > gap_threshold:
+                    gap_data = {
+                        "from_z": prev_z,
+                        "to_z": z,
+                        "gap_size": vertical_gap,
+                        "layers": (prev_layer_idx, layer_idx),
+                    }
+
+                    if prev_type == "support" and current_type == "support":
+                        self.analysis_results["support_vertical_gaps"].append(gap_data)
+                    elif prev_type == "model" and current_type == "model":
+                        self.analysis_results["model_vertical_gaps"].append(gap_data)
+                    else:
+                        # Cross-type transition (model<->support)
+                        self.analysis_results["potential_issues"].append(
+                            f"Type transition gap between {prev_type} and {current_type} "
+                            f"at Z{prev_z:.2f}-{z:.2f} (Δ{vertical_gap:.2f}mm)"
+                        )
+
+        for z, paths in self.layer_data:
+            # Create buffered polygons
+            current_poly = Polygon(paths).buffer(0.05)
+            prev_poly = prev_paths.buffer(0.05) if prev_paths else None
+
+            # Check vertical spacing
+            if prev_z is not None:
+                vertical_gap = z - prev_z
+
+            # Check overlap
+            if prev_poly and not current_poly.intersects(prev_poly):
+                self.analysis_results["vertical_gaps"].append((prev_z, z, vertical_gap))
+
+            # Check horizontal overlap
+            if prev_paths:
+                current_polys = []
+                prev_polys = []
+
+                # Log current layer processing
+                self.logger.debug(f"Analyzing layer {z}mm with {len(paths)} points")
+
+                try:
+                    if paths:
+                        self.logger.debug(
+                            f"Creating current polygons from {len(paths)} points"
+                        )
+                        current_poly = make_valid(Polygon(paths))
+                        if current_poly.is_valid:
+                            current_polys = [current_poly]
+                            self.logger.debug(
+                                f"Created valid current polygon with area {current_poly.area:.2f}mm²"
+                            )
+                        else:
+                            self.logger.warning(f"Invalid current polygon at {z}mm")
+                            self.analysis_results["potential_issues"].append(
+                                f"Invalid geometry at {z}mm"
+                            )
+
+                    if prev_paths:
+                        self.logger.debug(
+                            f"Creating previous polygons from {len(prev_paths)} points"
+                        )
+                        prev_poly = make_valid(Polygon(prev_paths))
+                        if prev_poly.is_valid:
+                            prev_polys = [prev_poly]
+                            self.logger.debug(
+                                f"Created valid previous polygon with area {prev_poly.area:.2f}mm²"
+                            )
+                        else:
+                            self.logger.warning(
+                                f"Invalid previous polygon at {prev_z}mm"
+                            )
+                            self.analysis_results["potential_issues"].append(
+                                f"Invalid geometry at {prev_z}mm"
+                            )
+
+                    if current_polys and prev_polys:
+                        self.logger.info(
+                            f"Comparing {len(current_polys)} current vs {len(prev_polys)} previous polys"
+                        )
+                        tree = STRtree(current_polys)
+
+                        for prev_poly in prev_polys:
+                            self.logger.debug(
+                                f"Checking overlaps for previous poly area {prev_poly.area:.2f}mm²"
+                            )
+                            candidate_indices = tree.query(prev_poly)
+                            candidates = [current_polys[i] for i in candidate_indices]
+                            self.logger.debug(
+                                f"Found {len(candidates)} potential overlaps"
+                            )
+
+                            overlap_found = any(
+                                self.safe_intersection_area(cp, prev_poly) > 0
+                                for cp in candidates
+                            )
+
+                        if not overlap_found:
+                            self.logger.warning(
+                                f"No overlap found between layers {prev_z}mm and {z}mm"
+                            )
+                            self.analysis_results["horizontal_overlaps"].append(
+                                (prev_z, z, prev_poly.centroid)
+                            )
+                except Exception as e:
+                    self.logger.error(
+                        f"Overlap analysis failed: {str(e)}", exc_info=True
+                    )
+                    self.analysis_results["potential_issues"].append(
+                        f"Analysis error: {str(e)}"
+                    )
+
+            prev_z = z
+            prev_paths = paths
+            prev_type = current_type
+            prev_layer_idx = layer_idx
+
+    def _get_support_gap_report(self):
+        report = []
+        support_gaps = self.analysis_results["support_vertical_gaps"]
+
+        if support_gaps:
+            report.append("\nSupport Structure Gaps:")
+            for idx, gap in enumerate(support_gaps, 1):
+                report.append(
+                    f"  Gap {idx}: Layers {gap['layers'][0]}-{gap['layers'][1]} "
+                    f"(Z{gap['from_z']:.2f} → Z{gap['to_z']:.2f}, "
+                    f"Δ{gap['gap_size']:.2f}mm)"
+                )
+        else:
+            report.append("\nNo support structure gaps detected")
+
+        return report
+
+    def safe_intersection_area(self, poly1, poly2):
+        try:
+            self.logger.info(f"Intersection succeeded")
+            return poly1.intersection(poly2).area
+
+        except Exception as e:
+            self.logger.warning(f"Intersection failed: {str(e)}")
+            return 0
+
+    def is_path_closed(self, path):
+        if len(path) < 2:
+            return False
+        dx = abs(path[0][0] - path[-1][0])
+        dy = abs(path[0][1] - path[-1][1])
+        return dx < self.closure_tolerance and dy < self.closure_tolerance
 
     def _calculate_z_speed(self, delta_z):
         if delta_z <= self.safe_z_distance:
@@ -169,13 +480,10 @@ class GCodeProcessor:
             return line_bytes.decode("utf-8", errors="replace")
 
     def _is_travel_move(self, path):
-        """Detect short moves that aren't real perimeters using buffered length check"""
+        """Detect short moves that aren't real perimeters"""
         if len(path) < 2:
             return True
-        ls = LineString(path)
-        return ls.length < self.travel_threshold or ls.buffer(0.05).area < (
-            self.nozzle_diameter**2
-        )
+        return LineString(path).length < self.travel_threshold
 
     def _configure_logging(self, log_level):
         self.logger = logging.getLogger("Bricklayers")
@@ -185,45 +493,24 @@ class GCodeProcessor:
             formatter = logging.Formatter(
                 "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
             )
+
+            # Rotating file handler with debug level
             rotating_handler = logging.handlers.RotatingFileHandler(
                 "bricklayers.log",
                 maxBytes=10 * 1024 * 1024,
                 backupCount=5,
                 encoding="utf-8",
             )
+            rotating_handler.setLevel(log_level)  # Critical fix!
             rotating_handler.setFormatter(formatter)
+
+            # Console handler with debug level
             console_handler = logging.StreamHandler()
-            console_handler.setLevel(logging.ERROR)
+            console_handler.setLevel(log_level)  # Changed from logging.ERROR
             console_handler.setFormatter(formatter)
+
             self.logger.addHandler(rotating_handler)
             self.logger.addHandler(console_handler)
-
-    def calculate_layer_bounds(self, polygons):
-        """Calculate axis-aligned bounding box for entire layer"""
-        if not polygons:
-            return None
-        minx = min(p.bounds[0] for p in polygons)
-        miny = min(p.bounds[1] for p in polygons)
-        maxx = max(p.bounds[2] for p in polygons)
-        maxy = max(p.bounds[3] for p in polygons)
-        return (minx, miny, maxx, maxy)
-
-    def is_boundary_proximal(self, polygon, layer_bounds):
-        """Check if polygon is near layer edge with nozzle-based tolerance"""
-        if not layer_bounds:
-            return False
-
-        tol = self.nozzle_diameter * 2.5  # 2.5x nozzle width tolerance
-        poly_bounds = polygon.bounds
-
-        return any(
-            [
-                abs(poly_bounds[0] - layer_bounds[0]) < tol,  # minx
-                abs(poly_bounds[1] - layer_bounds[1]) < tol,  # miny
-                abs(poly_bounds[2] - layer_bounds[2]) < tol,  # maxx
-                abs(poly_bounds[3] - layer_bounds[3]) < tol,  # maxy
-            ]
-        )
 
     def detect_printer_type(self, file_path):
         with open(file_path, "r") as f:
@@ -231,55 +518,10 @@ class GCodeProcessor:
                 for line in iter(mm.readline, b""):
                     decoded_line = self.decode_line(line)
                     if "; FEATURE:" in decoded_line:
-                        return PrinterType.BAMBU.value
+                        return PrinterType.BAMBU
                     if ";TYPE:" in decoded_line:
-                        return PrinterType.PRUSA.value
-                return PrinterType.PRUSA.value
-
-    @staticmethod
-    def detect_nozzle_diameter(file_path):
-        default_nozzle = 0.4
-        try:
-            with open(file_path, "r") as f:
-                for line in f:
-                    if line.startswith("; nozzle_diameter = "):
-                        return float(line.split("=")[1].strip())
-                    if "Nozzle diameter" in line:
-                        return float(re.search(r"\d+\.?\d*", line).group())
-        except Exception as e:
-            print(f"Nozzle detection failed: {str(e)}")
-
-        return default_nozzle
-
-    def _detect_infill_lines(self, layer_lines):
-        """Precision infill detection for PrusaSlicer types"""
-        infill_markers = {
-            PrinterType.BAMBU.value: [
-                "; FEATURE:Internal infill",
-                "; FEATURE:Sparse infill",
-            ],
-            PrinterType.PRUSA.value: [
-                ";TYPE:Solid infill",
-                ";TYPE:Internal infill",
-                ";TYPE:Top solid infill",
-                ";TYPE:Bridge infill",
-            ],
-        }
-
-        return {
-            idx
-            for idx, line in enumerate(layer_lines)
-            if any(marker in line for marker in infill_markers[self.printer_type])
-        }
-
-    def _get_perimeter_indices(self, outer_perimeters, inner_perimeters):
-        """Get line indices from geometrically classified perimeters"""
-        return {
-            line_idx
-            for perim_set in [outer_perimeters, inner_perimeters]
-            for poly_info in perim_set  # Each poly_info is (polygon, line_indices, perimeter_type)
-            for line_idx in poly_info[1]  # Index 1 contains the original line numbers
-        }
+                        return PrinterType.PRUSA
+                return PrinterType.PRUSA
 
     def detect_layer_height(self, file_path):
         z_values = []
@@ -333,12 +575,12 @@ class GCodeProcessor:
                 continue
 
             # Printer-specific type detection
-            if self.printer_type == PrinterType.BAMBU.value:
+            if self.printer_type == PrinterType.BAMBU:
                 if "; FEATURE" in line:
                     current_type = (
                         PerimeterType.INNER if "Inner" in line else PerimeterType.OUTER
                     )
-            elif self.printer_type == PrinterType.PRUSA.value:
+            elif self.printer_type == PrinterType.PRUSA:
                 if ";TYPE:" in line:
                     current_type = (
                         PerimeterType.OUTER
@@ -491,172 +733,102 @@ class GCodeProcessor:
             except:
                 return 0.0
 
-    def classify_perimeters(self, perimeter_paths, use_explicit_types=False):
-        """Enhanced hierarchical perimeter classification with boundary awareness"""
-        # Extract polygons and calculate layer bounds
-        all_polygons = [poly for poly, _, _ in perimeter_paths]
-        layer_bounds = self.calculate_layer_bounds(all_polygons)
+    def classify_perimeters(self, perimeter_paths):
+        classified = {"outer": [], "inner": []}
+        unclassified = []
 
-        # Sort polygons by descending area for hierarchical processing
-        sorted_polys = sorted(perimeter_paths, key=lambda x: x[0].area, reverse=True)
-
-        classified = {"outer": [], "inner": [], "unclassified": []}
-        hierarchy_tree = STRtree([poly for poly, _, _ in sorted_polys])
-
-        layer_complex = False  # Track complexity for entire layer
-        for poly, lines, ptype in sorted_polys:
-            # First check explicit type from slicer
-            if use_explicit_types:
-                if ptype == PerimeterType.OUTER:
-                    classified["outer"].append((poly, lines))
-                    continue
-                if ptype == PerimeterType.INNER:
-                    classified["inner"].append((poly, lines))
-                    continue
-
-            # Automatic classification logic
-            is_boundary = self.is_boundary_proximal(poly, layer_bounds)
-            parents = hierarchy_tree.query(poly, predicate="contains")
-            containment_depth = len(parents)
-
-            # Classification rules
-            if is_boundary:
-                perimeter_type = PerimeterType.OUTER
-            elif containment_depth % 2 == 0:  # Even containment = outer
-                perimeter_type = PerimeterType.OUTER
+        for poly, lines, ptype in perimeter_paths:
+            if ptype == PerimeterType.OUTER:
+                classified["outer"].append((poly, lines))
+            elif ptype == PerimeterType.INNER:
+                classified["inner"].append((poly, lines))
             else:
-                perimeter_type = PerimeterType.INNER
+                unclassified.append((poly, lines))
 
-            # Secondary validation
-            if perimeter_type == PerimeterType.OUTER:
-                # Verify not contained by other outer perimeters
-                existing_outers = [p for p, _ in classified["outer"]]
-                outer_tree = STRtree(existing_outers)
-                containing_outers = outer_tree.query(poly, predicate="contains")
-                if any(containing_outers):
-                    perimeter_type = PerimeterType.INNER
+        if unclassified and (classified["outer"] or classified["inner"]):
+            outer_polys = [p for p, _ in classified["outer"]]
+            tree = STRtree(outer_polys) if outer_polys else None
 
-            # Complex feature detection
-            complex_detected = False
-            if perimeter_type == PerimeterType.OUTER:
-                # Check for nested outer perimeters
-                if containment_depth > 0:
-                    complex_detected = True
-                    self.logger.debug(
-                        f"Nested outer perimeter detected at layer {self.current_layer}"
-                    )
+            for poly, lines in unclassified:
+                is_inner = False
+                if tree:
+                    candidate_indices = tree.query(poly)
+                    candidates = [outer_polys[i] for i in candidate_indices]
 
-                # Check for disconnected outer features
-                if len(classified["outer"]) >= 1 and not any(
-                    p.contains(poly) for p, _ in classified["outer"]
-                ):
-                    complex_detected = True
-                    self.logger.debug(
-                        f"Multiple outer perimeters detected at layer {self.current_layer}"
-                    )
+                    containing_outers = [
+                        op for op in candidates if op.contains(poly.buffer(-0.01))
+                    ]
 
-            classified[
-                "outer" if perimeter_type == PerimeterType.OUTER else "inner"
-            ].append((poly, lines))
+                    if containing_outers:
+                        parent_outer = max(
+                            containing_outers, key=lambda op: op.intersection(poly).area
+                        )
+                        area_ratio = poly.area / parent_outer.area
+                        if area_ratio < 0.75:
+                            intersection = parent_outer.intersection(poly).area
+                            if intersection / poly.area >= 0.95:
+                                is_inner = True
+                    else:
+                        nearest_idx = tree.nearest(poly)
+                        nearest = outer_polys[nearest_idx]
+                        distance = poly.distance(nearest)
+                        if distance < self.min_distance * 0.5:
+                            if poly.area / nearest.area < 0.25:
+                                is_inner = True
 
-        # Log classification results
-        if sorted_polys:  # Only log if we processed perimeters
-            self.logger.debug(
-                f"Layer {self.current_layer} classification: "
-                f"Outer={len(classified['outer'])} "
-                f"Inner={len(classified['inner'])} "
-                f"Complex={layer_complex} "
-                f"Unclassified={len(classified['unclassified'])}"
-            )
+                classified["inner" if is_inner else "outer"].append((poly, lines))
 
         return classified["outer"], classified["inner"]
 
-    def should_stagger(self, perimeter_type, feature_type):
-        # Never stagger outer perimeters or bridges
-        if perimeter_type == PerimeterType.OUTER:
-            return False
-        if feature_type == FeatureType.BRIDGE:
-            return False
-        return True
+    def blocks_from_geometric_classification(
+        self, layer_lines, outer_paths, inner_paths
+    ):
+        """Convert geometric analysis results to processing blocks"""
+        blocks = []
+        current_block = []
+        current_type = None
 
-    def process_layer(self, layer_lines, layer_num, total_layers):
-        self.current_layer = layer_num  # Critical for all layer-bound operations
-        layer_start = datetime.now()
-        processed = []
+        for line in layer_lines:
+            if line.startswith("G1") and "X" in line and "Y" in line:
+                x = float(self.re_x.search(line).group(1))
+                y = float(self.re_y.search(line).group(1))
 
-        # Calculate brick layering pattern (2-layer cycle)
-        self.brick_phase = (layer_num // self.brick_height_layers) % 2
-        z_shift_amount = self.brick_z_shift if self.brick_phase else 0
+                # Check if point belongs to geometric classification
+                point = Point(x, y)
+                is_outer = any(poly.contains(point) for poly, _ in outer_paths)
+                is_inner = any(poly.contains(point) for poly, _ in inner_paths)
 
-        # Parse and classify geometry
-        try:
-            perimeter_data = self.parse_perimeter_paths(layer_lines)
-            outer_perimeters, inner_perimeters = self.classify_perimeters(
-                perimeter_data,
-                use_explicit_types=(self.printer_type == PrinterType.BAMBU.value),
-            )
-        except Exception as e:
-            self.logger.error(f"Layer classification failed: {str(e)}")
-            return layer_lines  # Fail-safe return of original lines
+                if is_outer:
+                    new_type = ";GEOM_ANALYSIS:Outer perimeter"
+                elif is_inner:
+                    new_type = ";GEOM_ANALYSIS:Inner perimeter"
+                else:
+                    new_type = None
 
-        # Feature detection
-        infill_lines = self._detect_infill_lines(layer_lines)
-        perimeter_indices = self._get_perimeter_indices(
-            outer_perimeters, inner_perimeters
-        )
+                if new_type != current_type:
+                    if current_block:
+                        blocks.append((current_block, current_type))
+                        current_block = []
+                    current_type = new_type
 
-        # Split layer content
-        perimeter_section = [
-            line for idx, line in enumerate(layer_lines) if idx in perimeter_indices
-        ]
-        infill_section = [
-            line for idx, line in enumerate(layer_lines) if idx in infill_lines
-        ]
+            current_block.append(line)
 
-        # Construct processed output
-        processed.extend(perimeter_section)
+        if current_block:
+            blocks.append((current_block, current_type))
 
-        # Apply Z-shift with collision protection
-        if z_shift_amount > 0:
-            new_z = self.current_z + z_shift_amount
-            processed.append(f"G1 Z{new_z:.3f} F{self.z_speed} ; BRICK_SHIFT\n")
-            self.shifted_blocks += 1
-            self.layer_shift_pattern.append(1)
+        return blocks
+
+    def _adjust_top_layers(self):
+        # Detect last 5 layers using actual Z position
+        if (self.max_model_z - self.current_z) <= 5 * self.layer_height:
             self.logger.debug(
-                f"Applied Z-shift: {z_shift_amount}mm at layer {layer_num}"
+                f"Applying top layer compensation at Z{self.current_z:.2f}"
             )
-        else:
-            new_z = self.current_z
-            processed.append(f"; NO_SHIFT (phase {self.brick_phase})\n")
-            self.layer_shift_pattern.append(0)
-
-        processed.extend(infill_section)
-
-        # Update state tracking
-        self.current_z = new_z
-
-        # Diagnostic logging
-        layer_duration = (datetime.now() - layer_start).total_seconds() * 1000
-        self.layer_times.append(layer_duration)
-
-        self.logger.info(
-            f"Layer {layer_num} [{'SHIFT' if z_shift_amount else '    '}] | "
-            f"Outer: {len(outer_perimeters):02d} | "
-            f"Inner: {len(inner_perimeters):02d} | "
-            f"Staggered: {len(infill_lines):03d} | "
-            f"Z: {new_z:06.2f}mm | "
-            f"Time: {layer_duration:05.1f}ms"
-        )
-
-        if self.logger.isEnabledFor(logging.DEBUG):
-            self.logger.debug(
-                f"Phase: {self.brick_phase} | "
-                f"Total shifts: {self.shifted_blocks} | "
-                f"Memory: {self.get_memory_usage():.1f}MB | "
-                f"Valid paths: {self.closed_paths} closed, {self.open_paths} open"
-            )
-
-        return processed
+            self.extrusion_multiplier *= 1.15  # 15% extra flow
+            # Smooth transition for preceding layers
+            for i in range(1, 4):
+                if (self.max_z - self.current_z) == i * self.layer_height:
+                    self.extrusion_multiplier *= 1 + 0.05 * (4 - i)
 
     def _get_current_precision_mode(self):
         if self.precision_mode == "auto":
@@ -714,22 +886,50 @@ class GCodeProcessor:
                 input_path = input_path.with_suffix(".gcode")
                 os.system(f"bgcode decode {input_file} -o {input_path}")
 
+            # Initial pass to detect maximum Z height
+            self.logger.info("Performing initial Z-height detection...")
+
+            with open(input_path, "r") as f:
+                for line in f:
+                    if line.startswith("G1 Z"):
+                        z_match = self.re_z.search(line)
+                        if z_match:
+                            current_z = float(z_match.group(1))
+                            if current_z > self.max_model_z:
+                                self.max_model_z = current_z
+            self.logger.info(
+                f"Detected maximum model Z-height: {self.max_model_z:.2f}mm"
+            )
+
             self.printer_type = self.detect_printer_type(input_path)
             self.layer_height = self.layer_height or self.detect_layer_height(
                 input_path
             )
-            self.z_shift = self.layer_height * 0.25
+
+            if self.layer_height_source == "auto":
+                self.logger.info(
+                    f"Automatically detected layer height: {self.layer_height:.2f}mm "
+                    f"(from {self.total_layers} layers)"
+                )
+            else:
+                self.logger.info(
+                    f"Using user-specified layer height: {self.layer_height:.2f}mm"
+                )
+
+            # Initialize memory tracking
+            self.max_mem_usage = self.get_memory_usage()
+            self.logger.info(f"Initial memory usage: {self.max_mem_usage:.2f}MB")
+
+            self.z_shift = self.layer_height * 0.5
             self.z_speed = self.z_speed or self.detect_z_speed(input_path)
 
             with open(input_path, "r+") as f:
                 with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                    # Detect layer change comment based on printer type
                     layer_change_marker = {
-                        PrinterType.BAMBU.value: "; CHANGE_LAYER",
-                        PrinterType.PRUSA.value: ";LAYER_CHANGE",
+                        PrinterType.BAMBU: "; CHANGE_LAYER",
+                        PrinterType.PRUSA: ";LAYER_CHANGE",
                     }[self.printer_type]
 
-                    # Count total layers based on layer change comments
                     self.total_layers = sum(
                         1
                         for line in iter(mm.readline, b"")
@@ -739,55 +939,118 @@ class GCodeProcessor:
 
                     with NamedTemporaryFile(mode="w", delete=False) as tmp_file:
                         layer_buffer = []
-                        current_layer = 0
+                        self.current_layer = 0  # Use instance variable
+                        current_z = 0.0
 
                         for line in iter(mm.readline, b""):
                             decoded_line = self.decode_line(line)
 
-                            # Track extrusion mode changes
-                            if "M82" in decoded_line:
-                                self.extrusion_mode = "absolute"
-                            elif "M83" in decoded_line:
-                                self.extrusion_mode = "relative"
+                            # Track Z position from G-code
+                            if decoded_line.startswith("G1 Z"):
+                                z_match = self.re_z.search(decoded_line)
+                                if z_match:
+                                    current_z = float(z_match.group(1))
+                                    self.current_z = current_z
 
                             layer_buffer.append(decoded_line)
 
-                            # Split layers ONLY at the correct layer change markers
                             if layer_change_marker in decoded_line:
-                                processed = self.process_layer(
-                                    layer_buffer, current_layer, self.total_layers
+                                self.logger.debug(
+                                    f"Processing layer {self.current_layer} at Z={current_z:.2f}"
                                 )
-                                tmp_file.writelines(processed)
-                                current_layer += 1
+                                processed_lines = self._process_alternating_blocks(
+                                    layer_buffer, current_z
+                                )
+                                self.current_layer += 1
+                                self.logger.debug(
+                                    f"Finished layer {self.current_layer-1}"
+                                )
+                                # Process completed layer
+                                processed_lines = self._process_alternating_blocks(
+                                    layer_buffer, current_z
+                                )
+                                tmp_file.writelines(processed_lines)
+
+                                # Update layer tracking
+                                # self.current_layer += 1
                                 layer_buffer = []
+
+                        if layer_change_marker in decoded_line:
+                            # Process completed layer
+                            if self.current_layer > 0:
+                                # Get geometric classification if needed
+                                if not any(b[1] for b in blocks):
+                                    self.logger.debug(
+                                        "No slicer perimeter markers found, using geometric analysis"
+                                    )
+                                    paths = self.parse_perimeter_paths(layer_buffer)
+                                    outer, inner = self.classify_perimeters(paths)
+                                    blocks = self.blocks_from_geometric_classification(
+                                        layer_buffer, outer, inner
+                                    )
+
+                                processed_lines = self._process_alternating_blocks(
+                                    layer_buffer, current_z, blocks
+                                )
 
                         # Process remaining lines after last layer marker
                         if layer_buffer:
-                            processed = self.process_layer(
-                                layer_buffer, current_layer, self.total_layers
+                            processed_lines = self._process_alternating_blocks(
+                                layer_buffer, current_z
                             )
-                            tmp_file.writelines(processed)
+                            tmp_file.writelines(processed_lines)
 
                         os.replace(tmp_file.name, input_path)
 
+            # Perform final quality analysis
+            self.logger.info("Performing post-processing analysis...")
+            self._analyze_layer_bonding()
+
+            self.total_time = sum(self.layer_times)
+            self.avg_layer_time = (
+                self.total_time / len(self.layer_times) if self.layer_times else 0
+            )
+            self.total_processing_time = (
+                datetime.now() - self.processing_start
+            ).total_seconds() * 1000
+            self.time_variance = (
+                sum((t - self.avg_layer_time) ** 2 for t in self.layer_times)
+                / len(self.layer_times)
+                if self.layer_times
+                else 0
+            )
+
             final_report = (
                 "════════════════════ Processing Complete ════════════════════\n"
-                f"Total Layers: {self.total_layers} | Shifted Layers: {sum(self.layer_shift_pattern)}\n"
-                f"Total Decoding Errors: {self.decoding_errors}\n"
-                f"Total Z-Shifts Applied: {self.shifted_blocks}\n"
+                f"Total Layers: {self.total_layers} | Layer Height: {self.layer_height:.2f}mm ({self.layer_height_source})\n"  # Changed line
+                f"Z-Shifts Applied: {self.total_shifts} | Shift Magnitude: ±{self.layer_height/2:.2f}mm\n"
+                f"Max Z: {self.max_model_z:.2f}mm | Potential Issues: {len(self.analysis_results['potential_issues'])}\n"
+                f"Model Layers: {len(self.analysis_results['model_layer_indices'])} | "
+                f"Support Layers: {len(self.analysis_results['support_layer_indices'])}\n"
+                f"Model Vertical Gaps: {len(self.analysis_results['model_vertical_gaps'])}\n"
+                f"Support Vertical Gaps: {len(self.analysis_results['support_vertical_gaps'])}\n"
+                f"Critical Transitions: {len([i for i in self.analysis_results['potential_issues'] if 'transition' in i])}\n"
+                f"Horizontal Overlap Issues: {len(self.analysis_results['horizontal_overlaps'])}\n"
+                f"Total Processing Time: {self.total_processing_time:.2f}ms\n"
+                f"Simplified Features: {self.simplified_features} | Failed Simplifications: {self.failed_simplifications}\n"
+                f"Closed Paths: {self.closed_paths} | Open Paths: {self.open_paths}\n"
+                f"Peak Memory Usage: {self.max_mem_usage:.2f}MB\n"
+                f"Layer Timing: {self.avg_layer_time:.2f}ms avg ±{self.time_variance**0.5:.2f}ms\n"
+                f"Decoding Errors: {self.decoding_errors} | Small Features Skipped: {self.skipped_small_features}\n"
                 f"Extrusion Adjustments: {self.total_extrusion_adjustments}\n"
-                f"Simplified Features: {self.simplified_features}\n"
-                f"Skipped Small Features: {self.skipped_small_features}\n"
-                f"Failed Simplifications: {self.failed_simplifications}\n"
-                f"Average Layer Time: {sum(self.layer_times)/len(self.layer_times)*1000:.2f}ms\n"
-                f"Total Processing Time: {(datetime.now()-self.processing_start).total_seconds()*1000:.2f}ms\n"
-                f"Peak Memory Usage: {self.get_memory_usage():.2f}MB\n"
-                f"Safety Settings | Max Z Speed: {self.max_z_speed}mm/min | Min Move Time: {self.min_z_move_time}s\n"
-                f"Precision Mode: {self.precision_mode} | Min Feature: {self.min_feature_size}mm | Critical Angle: {self.critical_angle}°\n"
-                f"Valid Paths: Closed={self.closed_paths} | Open={self.open_paths}\n"
                 "═════════════════════════════════════════════════════════════"
             )
+
+            for issue in self.analysis_results["potential_issues"]:
+                final_report += f"  ! {issue}\n"
+
+            final_report += "\n".join(self._get_support_gap_report())
+
             self.logger.info(final_report)
+
+        except Exception as e:
+            self.logger.error(f"Critical processing error: {str(e)}", exc_info=True)
+            raise
 
         finally:
             self.logger.removeHandler(log_handler)
@@ -821,11 +1084,11 @@ def main():
         default=True,
         help="...",
     )
-    parser.add_argument("-nozzleDiameter", type=float, default=None, help="...")
     parser.add_argument("-minDetail", type=float, default=0.2, help="...")
     parser.add_argument("-criticalAngle", type=float, default=25, help="...")
     parser.add_argument("-precision", choices=["auto", ...], default="auto", help="...")
     parser.add_argument("-minPerimeterPoints", type=int, default=3, help="...")
+    parser.add_argument("--version", action="version", version="Bricklayers 1.2")
 
     args = parser.parse_args()
 
@@ -847,8 +1110,6 @@ def main():
         critical_angle=args.criticalAngle,
         precision_mode=args.precision,
         min_perimeter_points=args.minPerimeterPoints,
-        nozzle_diameter=args.nozzleDiameter
-        or GCodeProcessor.detect_nozzle_diameter(args.inputFile),
     )
     processor.process_gcode(args.inputFile, args.bgcode)
 
