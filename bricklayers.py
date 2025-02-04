@@ -48,7 +48,7 @@ class GCodeProcessor:
         self,
         layer_height=None,
         extrusion_multiplier=1.0,
-        first_layer_multiplier=None,
+        first_layer_multiplier=1.5,
         last_layer_multiplier=None,
         min_distance=0.1,
         max_intersection_area=0.5,
@@ -118,6 +118,11 @@ class GCodeProcessor:
         self.max_model_z = 0.0
         self.layer_data = []  # Stores (z_height, paths) tuples
         self.layer_height_source = "user" if layer_height else "auto"
+        self.first_layer_height = (
+            self.layer_height * self.first_layer_multiplier
+            if self.layer_height
+            else None
+        )
         self.analysis_results = {
             "model_vertical_gaps": [],
             "support_vertical_gaps": [],
@@ -127,12 +132,16 @@ class GCodeProcessor:
             "model_layer_indices": set(),
         }
         self.overhang_markers = {
-            PrinterType.BAMBU: (";FEATURE:Overhang", ";BRIDGE", ";_BRIDGE"),
+            PrinterType.BAMBU: (
+                ";FEATURE:Overhang",
+                # ";BRIDGE",
+                # ";_BRIDGE"
+            ),
             PrinterType.PRUSA: (
                 ";TYPE:Overhang perimeter",
-                ";_BRIDGE_",
-                ";BRIDGE",
-                ";TYPE:Bridge infill",
+                # ";_BRIDGE_",
+                # ";BRIDGE",
+                # ";TYPE:Bridge infill",
             ),
         }
 
@@ -165,119 +174,140 @@ class GCodeProcessor:
             return match.group(0)
 
     def _identify_perimeter_blocks(self, layer_lines):
+        """Group G-code lines into blocks based on perimeter features."""
         blocks = []
         current_block = []
         current_feature = None
-        feature_markers = {
-            PrinterType.PRUSA: [";TYPE:External perimeter", ";TYPE:Perimeter"],
-            PrinterType.BAMBU: [";FEATURE:Outer wall", ";FEATURE:Inner wall"],
-        }[self.printer_type]
 
         for line in layer_lines:
-            # Detect feature changes
-            if any(marker in line for marker in feature_markers):
-                if current_block:
-                    blocks.append((current_block, current_feature))
-                    current_block = []
-                current_feature = line.strip()  # Store raw comment
-            elif line.startswith(";") and "TYPE:" in line:
-                # Non-perimeter feature (brim, skirt, etc)
-                if current_block:
-                    blocks.append((current_block, current_feature))
-                    current_block = []
-                current_feature = None
+            # Check for feature changes in comment lines
+            if line.startswith(";"):
+                if self._is_perimeter(line):
+                    # Save the previous block if it exists
+                    if current_block:
+                        blocks.append((current_block, current_feature))
+                        current_block = []
+                    # Start new perimeter block
+                    current_feature = line.strip()
+                elif "TYPE:" in line or "FEATURE:" in line:
+                    # Non-perimeter feature marker - end current block
+                    if current_block:
+                        blocks.append((current_block, current_feature))
+                        current_block = []
+                    current_feature = None
 
             current_block.append(line)
 
+        # Don't forget the last block
         if current_block:
             blocks.append((current_block, current_feature))
 
         return blocks
 
+    def _is_custom_block(self, feature_type):
+        """Check if this is a custom G-code block that should not be modified"""
+        return feature_type and "TYPE:Custom" in feature_type
+
     def _process_alternating_blocks(self, layer_lines, current_z):
         processed = []
-        blocks = self._identify_perimeter_blocks(layer_lines)
-        shift_magnitude = round(self.layer_height * 0.5, 3)  # 0.10mm for 0.20mm
-        non_perim_counter = 0
-        full_shift_details = []
+        current_feature = None
+        base_z = current_z
+        current_z_position = base_z
+        current_block_lines = []
 
-        re_z = re.compile(r"Z(-?\d*\.?\d{1,3})")
+        for line in layer_lines:
+            if line.startswith(";TYPE:"):
+                # Process previous block if it exists
+                if current_block_lines:
+                    # Track block statistics
+                    if current_feature:
+                        self.block_statistics["total_blocks"] += 1
+                        self.block_statistics["by_type"][current_feature] = (
+                            self.block_statistics["by_type"].get(current_feature, 0) + 1
+                        )
 
-        for block, feature_type in blocks:
-            modified_block = []
-            current_z_round = round(current_z, 3)
-            applied_shift = 0.0
+                    modifications = {
+                        "original_lines": current_block_lines.copy(),
+                        "modified_lines": [],
+                        "z_height": False,
+                        "extrusion": False,
+                    }
 
-            if "support" in str(feature_type).lower():
-                applied_shift = shift_magnitude  # Always apply shift to supports
-            else:
-                applied_shift = shift_magnitude if (non_perim_counter % 2 == 0) else 0.0
+                    if not self._is_custom_block(current_feature):
+                        target_z = base_z
+                        if not self._is_perimeter(current_feature):
+                            if self.current_layer == 0:
+                                # First layer: Print non-perimeters at 150% height
+                                target_z = base_z + (self.layer_height * 0.5)
+                                modifications["z_height"] = True
+                                modifications["z_delta"] = self.layer_height * 0.5
+                                modifications["new_height"] = target_z
+                                self.block_statistics["first_layer_height_mods"] += 1
+                                self.block_statistics["total_z_modifications"] += 1
 
-            if not self._is_perimeter(feature_type):
-                applied_shift = shift_magnitude if (non_perim_counter % 2 == 0) else 0.0
-                applied_shift = round(applied_shift, 3)
-                non_perim_counter += 1  # Increment after assignment
-
-                for line in block:
-                    if line.startswith("G1") and "Z" in line:
-                        z_match = re_z.search(line)
-                        if z_match:
-                            original_z = round(float(z_match.group(1)), 3)
-                            new_z = round(original_z + applied_shift, 3)
-
-                            if new_z != original_z:
-                                modified = re.sub(re_z, f"Z{new_z:.3f}", line)
-                                full_shift_details.append(
-                                    {
-                                        "feature": feature_type,
-                                        "original": line.strip(),
-                                        "modified": modified.strip(),
-                                        "ΔZ": new_z - original_z,
-                                    }
+                                # Add descriptive comment
+                                processed.append(
+                                    f"; [BRICKLAYER] First layer non-perimeter at 150% height ({target_z:.3f}mm)\n"
                                 )
-                                self.total_shifts += 1  # Update counter here
+
                             else:
-                                modified = line
-                        else:
-                            modified = line
+                                # Subsequent layers: maintain the offset
+                                target_z = base_z + (self.layer_height * 0.5)
+                                if abs(target_z - current_z_position) > 0.001:
+                                    modifications["z_height"] = True
+                                    modifications["z_delta"] = (
+                                        target_z - current_z_position
+                                    )
+                                    self.block_statistics["total_z_modifications"] += 1
 
-                        modified_block.append(modified)
-                    else:
-                        modified_block.append(line)
-            else:
-                modified_block = block
+                                    processed.append(
+                                        f"; [BRICKLAYER] Maintaining +{self.layer_height * 0.5:.3f}mm offset\n"
+                                    )
 
-            processed.extend(modified_block)
+                        if modifications["z_height"]:
+                            z_speed = self._calculate_z_speed(
+                                abs(target_z - current_z_position)
+                            )
+                            processed.append(
+                                f"G1 Z{target_z:.3f} F{z_speed:.0f} ; Z adjustment\n"
+                            )
+                            current_z_position = target_z
 
-        # Detailed logging
-        if full_shift_details:
-            self.logger.debug(
-                f"Layer {self.current_layer} applied {len(full_shift_details)} shifts"
-            )
-            log_msg = [
-                f"\n── Layer {self.current_layer} (Z={current_z_round:.2f}mm) ──",
-                f"Total Shifts: {len(full_shift_details)}",
-                f"Layer Height: {self.layer_height:.2f}mm ({self.layer_height_source})",
-                "Shift Details:",
-            ]
+                    # Log block details at DEBUG level
+                    self._log_block_details(
+                        current_block_lines, current_feature, modifications
+                    )
 
-            for idx, detail in enumerate(full_shift_details, 1):
-                log_msg.append(
-                    f"  Shift {idx}:\n"
-                    f"    Original: {detail['original']}\n"
-                    f"    Modified: {detail['modified']}\n"
-                    f"    ΔZ: {detail['ΔZ']:+.2f}mm"
-                )
+                    # Add all remaining lines from the block
+                    processed.extend(current_block_lines)
 
-            log_msg.append("─" * 40)
-            self.logger.debug("\n".join(log_msg))
+                # Start new block
+                current_feature = line.strip()
+                current_block_lines = [line]
+                continue
+
+            current_block_lines.append(line)
+
+        # Process final block
+        if current_block_lines:
+            if not self._is_custom_block(current_feature):
+                processed.extend(current_block_lines)
 
         return processed
 
     def _is_perimeter(self, feature_comment):
-        """Check if a feature comment indicates perimeter OR SUPPORT"""
+        """Check if a feature comment indicates perimeter"""
         if not feature_comment:
             return False
+
+        # Check for printer-specific overhang markers
+        if self.printer_type in self.overhang_markers:
+            if any(
+                marker in feature_comment
+                for marker in self.overhang_markers[self.printer_type]
+            ):
+                return True
+
         return any(
             p in feature_comment.lower()
             for p in [
@@ -287,6 +317,9 @@ class GCodeProcessor:
                 "support",
                 "tree",
                 "brim",
+                "overhang",  # Added to include overhang features
+                "skirt",
+                "skirt/brim",
             ]
         )
 
@@ -867,8 +900,162 @@ class GCodeProcessor:
             )
         return line
 
+    def _log_block_details(self, block_lines, feature_type, modifications):
+        """Log detailed block information at DEBUG level"""
+        if self.logger.getEffectiveLevel() == logging.DEBUG:
+            block_summary = [
+                f"\n──── Block Details - Layer {self.current_layer} ────",
+                f"Feature Type: {feature_type}",
+                f"Classification: {'Perimeter' if self._is_perimeter(feature_type) else 'Non-Perimeter'}",
+            ]
+
+            # Log modifications
+            if modifications.get("extrusion"):
+                block_summary.append(f"Extrusion Modified: Yes")
+                block_summary.append(
+                    f"  Multiplier: {modifications['extrusion_multiplier']:.3f}"
+                )
+            else:
+                block_summary.append("Extrusion Modified: No")
+
+            if modifications.get("z_height"):
+                block_summary.append(f"Z-Height Modified: Yes")
+                block_summary.append(f"  Change: {modifications['z_delta']:+.3f}mm")
+                if self.current_layer == 0 and not self._is_perimeter(feature_type):
+                    block_summary.append(
+                        f"  First Layer Height: {modifications['new_height']:.3f}mm (150% of base height)"
+                    )
+            else:
+                block_summary.append("Z-Height Modified: No")
+
+            # Log original and modified code
+            block_summary.append("\nOriginal G-code:")
+            block_summary.extend(f"  {line.strip()}" for line in block_lines)
+
+            if modifications.get("modified_lines"):
+                block_summary.append("\nModified G-code:")
+                block_summary.extend(
+                    f"  {line.strip()}" for line in modifications["modified_lines"]
+                )
+
+            self.logger.debug("\n".join(block_summary))
+
+    def _is_header_line(self, line):
+        """Check if a line is part of the header section"""
+        header_markers = [
+            "; generated by PrusaSlicer",
+            "; thumbnail begin",
+            "; thumbnail end",
+            "; external perimeters extrusion width",
+            "; perimeters extrusion width",
+            "; infill extrusion width",
+            "; solid infill extrusion width",
+            "; top infill extrusion width",
+            "; support material extrusion width",
+            "; first layer extrusion width",
+            "M73 P0",  # Initial progress indicator
+            "; printing object",
+            "; stop printing object",
+        ]
+        return any(marker in line for marker in header_markers)
+
+    def _is_footer_content(self, line):
+        """Check if a line is part of the footer section"""
+        footer_markers = [
+            "; filament used [mm]",
+            "; filament used [cm3]",
+            "; filament used [g]",
+            "; filament cost",
+            "; total filament",
+            "; estimated printing time",
+            "; prusaslicer_config",
+            "; objects_info",
+        ]
+        return any(marker in line for marker in footer_markers)
+
+    def _generate_final_report(self):
+        """Generate and log the final processing report."""
+        # Calculate timing metrics
+        self.total_time = sum(self.layer_times)
+        self.avg_layer_time = (
+            self.total_time / len(self.layer_times) if self.layer_times else 0
+        )
+        self.total_processing_time = (
+            datetime.now() - self.processing_start
+        ).total_seconds() * 1000
+        self.time_variance = (
+            sum((t - self.avg_layer_time) ** 2 for t in self.layer_times)
+            / len(self.layer_times)
+            if self.layer_times
+            else 0
+        )
+
+        # Update memory tracking
+        current_mem = self.get_memory_usage()
+        self.max_mem_usage = max(self.max_mem_usage, current_mem)
+
+        final_report = [
+            "════════════════════ Processing Complete ════════════════════",
+            f"Total Layers: {self.total_layers} | Layer Height: {self.layer_height:.3f}mm ({self.layer_height_source})",
+            f"Max Z: {self.max_model_z:.2f}mm | Printer Type: {self.printer_type.value}",
+            "",
+            "Block Statistics:",
+            f"Total Blocks Processed: {self.block_statistics['total_blocks']}",
+            f"First Layer Height Modifications: {self.block_statistics['first_layer_height_mods']}",
+            f"Total Z-Shifts Applied: {self.block_statistics['total_z_modifications']}",
+            f"Total Extrusion Adjustments: {self.block_statistics['total_extrusion_modifications']}",
+            "",
+            "Blocks by Type:",
+        ]
+
+        for feature_type, count in sorted(self.block_statistics["by_type"].items()):
+            final_report.append(f"  {feature_type}: {count}")
+
+        final_report.extend(
+            [
+                "",
+                "Analysis Results:",
+                f"Model Layers: {len(self.analysis_results['model_layer_indices'])}",
+                f"Support Layers: {len(self.analysis_results['support_layer_indices'])}",
+                f"Model Vertical Gaps: {len(self.analysis_results['model_vertical_gaps'])}",
+                f"Support Vertical Gaps: {len(self.analysis_results['support_vertical_gaps'])}",
+                f"Horizontal Overlap Issues: {len(self.analysis_results['horizontal_overlaps'])}",
+                f"Critical Transitions: {len([i for i in self.analysis_results['potential_issues'] if 'transition' in i])}",
+                "",
+                "Performance Metrics:",
+                f"Processing Time: {self.total_processing_time:.2f}ms",
+                f"Peak Memory Usage: {self.max_mem_usage:.2f}MB",
+                f"Average Layer Time: {self.avg_layer_time:.2f}ms ±{self.time_variance**0.5:.2f}ms",
+                f"Simplified Features: {self.simplified_features} | Failed Simplifications: {self.failed_simplifications}",
+                f"Closed Paths: {self.closed_paths} | Open Paths: {self.open_paths}",
+                f"Skipped Small Features: {self.skipped_small_features}",
+                "═════════════════════════════════════════════════════════════",
+            ]
+        )
+
+        # Add potential issues
+        if self.analysis_results["potential_issues"]:
+            final_report.append("\nPotential Issues:")
+            for issue in self.analysis_results["potential_issues"]:
+                final_report.append(f"  ! {issue}")
+
+        # Add support gap report
+        final_report.append("\n" + "\n".join(self._get_support_gap_report()))
+
+        self.logger.info("\n".join(final_report))
+
     def process_gcode(self, input_file, is_bgcode=False):
+        """Process G-code file with bricklaying modifications."""
         self.processing_start = datetime.now()
+        self.block_statistics = {
+            "total_blocks": 0,
+            "by_type": {},
+            "total_z_modifications": 0,
+            "total_extrusion_modifications": 0,
+            "first_layer_height_mods": 0,
+        }
+
+        # Set up logging
         script_dir = os.path.dirname(os.path.abspath(__file__))
         current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         log_handler = logging.FileHandler(
@@ -886,45 +1073,23 @@ class GCodeProcessor:
                 input_path = input_path.with_suffix(".gcode")
                 os.system(f"bgcode decode {input_file} -o {input_path}")
 
-            # Initial pass to detect maximum Z height
-            self.logger.info("Performing initial Z-height detection...")
-
-            with open(input_path, "r") as f:
-                for line in f:
-                    if line.startswith("G1 Z"):
-                        z_match = self.re_z.search(line)
-                        if z_match:
-                            current_z = float(z_match.group(1))
-                            if current_z > self.max_model_z:
-                                self.max_model_z = current_z
-            self.logger.info(
-                f"Detected maximum model Z-height: {self.max_model_z:.2f}mm"
-            )
-
-            self.printer_type = self.detect_printer_type(input_path)
-            self.layer_height = self.layer_height or self.detect_layer_height(
-                input_path
-            )
-
-            if self.layer_height_source == "auto":
-                self.logger.info(
-                    f"Automatically detected layer height: {self.layer_height:.2f}mm "
-                    f"(from {self.total_layers} layers)"
-                )
-            else:
-                self.logger.info(
-                    f"Using user-specified layer height: {self.layer_height:.2f}mm"
-                )
-
-            # Initialize memory tracking
-            self.max_mem_usage = self.get_memory_usage()
-            self.logger.info(f"Initial memory usage: {self.max_mem_usage:.2f}MB")
-
-            self.z_shift = self.layer_height * 0.5
-            self.z_speed = self.z_speed or self.detect_z_speed(input_path)
-
+            # First pass: Detect file characteristics
+            self.logger.info("Analyzing file characteristics...")
             with open(input_path, "r+") as f:
                 with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                    # Detect max Z height
+                    for line in iter(mm.readline, b""):
+                        decoded_line = self.decode_line(line)
+                        if decoded_line.startswith("G1 Z"):
+                            z_match = self.re_z.search(decoded_line)
+                            if z_match:
+                                current_z = float(z_match.group(1))
+                                if current_z > self.max_model_z:
+                                    self.max_model_z = current_z
+
+                    mm.seek(0)
+
+                    # Count total layers
                     layer_change_marker = {
                         PrinterType.BAMBU: "; CHANGE_LAYER",
                         PrinterType.PRUSA: ";LAYER_CHANGE",
@@ -935,118 +1100,120 @@ class GCodeProcessor:
                         for line in iter(mm.readline, b"")
                         if layer_change_marker in self.decode_line(line)
                     )
-                    mm.seek(0)
 
+            # Detect printer characteristics
+            self.printer_type = self.detect_printer_type(input_path)
+            self.layer_height = self.layer_height or self.detect_layer_height(
+                input_path
+            )
+            self.z_speed = self.z_speed or self.detect_z_speed(input_path)
+            self.z_shift = self.layer_height * 0.5
+
+            # Log initial information
+            self.logger.info(f"Processing file: {input_path}")
+            self.logger.info(f"Printer type: {self.printer_type}")
+            self.logger.info(
+                f"Layer height: {self.layer_height:.3f}mm ({self.layer_height_source})"
+            )
+            self.logger.info(f"Maximum Z height: {self.max_model_z:.2f}mm")
+            self.logger.info(f"Total layers: {self.total_layers}")
+
+            # Second pass: Process and modify G-code
+            with open(input_path, "r+") as f:
+                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
                     with NamedTemporaryFile(mode="w", delete=False) as tmp_file:
-                        layer_buffer = []
-                        self.current_layer = 0  # Use instance variable
-                        current_z = 0.0
-
-                        for line in iter(mm.readline, b""):
+                        # Process header
+                        header_lines = []
+                        line = mm.readline()
+                        decoded_line = self.decode_line(line)
+                        while line and (
+                            self._is_header_line(decoded_line)
+                            or not decoded_line.strip()
+                        ):
+                            header_lines.append(decoded_line)
+                            line = mm.readline()
                             decoded_line = self.decode_line(line)
 
-                            # Track Z position from G-code
+                        # Write header unmodified
+                        tmp_file.writelines(header_lines)
+
+                        # Process main content
+                        layer_buffer = []
+                        self.current_layer = 0
+                        self.current_z = 0.0
+                        in_custom_block = False
+
+                        while line:
+                            decoded_line = self.decode_line(line)
+
+                            # Track Z position
                             if decoded_line.startswith("G1 Z"):
                                 z_match = self.re_z.search(decoded_line)
                                 if z_match:
-                                    current_z = float(z_match.group(1))
-                                    self.current_z = current_z
+                                    self.current_z = float(z_match.group(1))
 
-                            layer_buffer.append(decoded_line)
-
-                            if layer_change_marker in decoded_line:
-                                self.logger.debug(
-                                    f"Processing layer {self.current_layer} at Z={current_z:.2f}"
-                                )
+                            # Handle custom blocks
+                            if decoded_line.startswith(";TYPE:Custom"):
+                                if layer_buffer:
+                                    processed_lines = self._process_alternating_blocks(
+                                        layer_buffer, self.current_z
+                                    )
+                                    tmp_file.writelines(processed_lines)
+                                    layer_buffer = []
+                                in_custom_block = True
+                                tmp_file.write(decoded_line)
+                            elif in_custom_block:
+                                if decoded_line.startswith(";TYPE:"):
+                                    in_custom_block = False
+                                    layer_buffer.append(decoded_line)
+                                else:
+                                    tmp_file.write(decoded_line)
+                            # Handle footer
+                            elif self._is_footer_content(decoded_line):
+                                if layer_buffer:
+                                    processed_lines = self._process_alternating_blocks(
+                                        layer_buffer, self.current_z
+                                    )
+                                    tmp_file.writelines(processed_lines)
+                                    layer_buffer = []
+                                tmp_file.write(decoded_line)
+                                # Copy remaining footer content
+                                remaining = mm.read()
+                                tmp_file.write(self.decode_line(remaining))
+                                break
+                            # Handle layer changes
+                            elif layer_change_marker in decoded_line:
+                                layer_buffer.append(decoded_line)
                                 processed_lines = self._process_alternating_blocks(
-                                    layer_buffer, current_z
-                                )
-                                self.current_layer += 1
-                                self.logger.debug(
-                                    f"Finished layer {self.current_layer-1}"
-                                )
-                                # Process completed layer
-                                processed_lines = self._process_alternating_blocks(
-                                    layer_buffer, current_z
+                                    layer_buffer, self.current_z
                                 )
                                 tmp_file.writelines(processed_lines)
-
-                                # Update layer tracking
-                                # self.current_layer += 1
                                 layer_buffer = []
-
-                        if layer_change_marker in decoded_line:
-                            # Process completed layer
-                            if self.current_layer > 0:
-                                # Get geometric classification if needed
-                                if not any(b[1] for b in blocks):
-                                    self.logger.debug(
-                                        "No slicer perimeter markers found, using geometric analysis"
-                                    )
-                                    paths = self.parse_perimeter_paths(layer_buffer)
-                                    outer, inner = self.classify_perimeters(paths)
-                                    blocks = self.blocks_from_geometric_classification(
-                                        layer_buffer, outer, inner
-                                    )
-
-                                processed_lines = self._process_alternating_blocks(
-                                    layer_buffer, current_z, blocks
+                                self.current_layer += 1
+                                self.logger.debug(
+                                    f"Processed layer {self.current_layer-1} at Z={self.current_z:.3f}"
                                 )
+                            else:
+                                layer_buffer.append(decoded_line)
 
-                        # Process remaining lines after last layer marker
+                            line = mm.readline()
+
+                        # Process any remaining content
                         if layer_buffer:
                             processed_lines = self._process_alternating_blocks(
-                                layer_buffer, current_z
+                                layer_buffer, self.current_z
                             )
                             tmp_file.writelines(processed_lines)
 
-                        os.replace(tmp_file.name, input_path)
+                    # Replace original file with modified version
+                    os.replace(tmp_file.name, input_path)
 
-            # Perform final quality analysis
+            # Perform post-processing analysis
             self.logger.info("Performing post-processing analysis...")
             self._analyze_layer_bonding()
 
-            self.total_time = sum(self.layer_times)
-            self.avg_layer_time = (
-                self.total_time / len(self.layer_times) if self.layer_times else 0
-            )
-            self.total_processing_time = (
-                datetime.now() - self.processing_start
-            ).total_seconds() * 1000
-            self.time_variance = (
-                sum((t - self.avg_layer_time) ** 2 for t in self.layer_times)
-                / len(self.layer_times)
-                if self.layer_times
-                else 0
-            )
-
-            final_report = (
-                "════════════════════ Processing Complete ════════════════════\n"
-                f"Total Layers: {self.total_layers} | Layer Height: {self.layer_height:.2f}mm ({self.layer_height_source})\n"  # Changed line
-                f"Z-Shifts Applied: {self.total_shifts} | Shift Magnitude: ±{self.layer_height/2:.2f}mm\n"
-                f"Max Z: {self.max_model_z:.2f}mm | Potential Issues: {len(self.analysis_results['potential_issues'])}\n"
-                f"Model Layers: {len(self.analysis_results['model_layer_indices'])} | "
-                f"Support Layers: {len(self.analysis_results['support_layer_indices'])}\n"
-                f"Model Vertical Gaps: {len(self.analysis_results['model_vertical_gaps'])}\n"
-                f"Support Vertical Gaps: {len(self.analysis_results['support_vertical_gaps'])}\n"
-                f"Critical Transitions: {len([i for i in self.analysis_results['potential_issues'] if 'transition' in i])}\n"
-                f"Horizontal Overlap Issues: {len(self.analysis_results['horizontal_overlaps'])}\n"
-                f"Total Processing Time: {self.total_processing_time:.2f}ms\n"
-                f"Simplified Features: {self.simplified_features} | Failed Simplifications: {self.failed_simplifications}\n"
-                f"Closed Paths: {self.closed_paths} | Open Paths: {self.open_paths}\n"
-                f"Peak Memory Usage: {self.max_mem_usage:.2f}MB\n"
-                f"Layer Timing: {self.avg_layer_time:.2f}ms avg ±{self.time_variance**0.5:.2f}ms\n"
-                f"Decoding Errors: {self.decoding_errors} | Small Features Skipped: {self.skipped_small_features}\n"
-                f"Extrusion Adjustments: {self.total_extrusion_adjustments}\n"
-                "═════════════════════════════════════════════════════════════"
-            )
-
-            for issue in self.analysis_results["potential_issues"]:
-                final_report += f"  ! {issue}\n"
-
-            final_report += "\n".join(self._get_support_gap_report())
-
-            self.logger.info(final_report)
+            # Generate final report
+            self._generate_final_report()
 
         except Exception as e:
             self.logger.error(f"Critical processing error: {str(e)}", exc_info=True)
@@ -1055,6 +1222,8 @@ class GCodeProcessor:
         finally:
             self.logger.removeHandler(log_handler)
             log_handler.close()
+
+        return self.block_statistics, self.analysis_results
 
 
 def main():
