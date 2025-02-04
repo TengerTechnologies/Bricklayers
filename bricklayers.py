@@ -13,7 +13,7 @@
 #
 # Copyright (c) [2025] [Roman Tenger]
 
-# TODO: Figure out why there are vertical layer gaps in support structures and resolve that issue.
+# TODO: Figure out why there are scattered vertical layer gaps in perimeters and support structures and resolve those issues.
 
 from datetime import datetime
 import mmap
