@@ -529,30 +529,6 @@ class GCodeProcessor:
                     line = f"G1 Z{new_z:.3f} F{self.z_speed} ; brick_shift {z_shift:+.3f}mm\n"
                     z_shift_applied = True
 
-            # Apply XY shifts with enhanced overhang handling
-            current_shift = xy_shift
-            if is_overhang:
-                current_shift *= (
-                    0.2  # Reduce to 20% of normal shift (0.01mm @ 0.2mm layers)
-                )
-                self.logger.debug(f"Overhang shift reduction: {current_shift:.3f}mm")
-            elif is_bridge:
-                current_shift = 0
-                self.logger.debug("Bridge detected - zero shift")
-
-            if line_idx in perimeter_lines and ("X" in line or "Y" in line):
-                # Apply shifts
-                line = re.sub(
-                    self.re_x,
-                    lambda m: f"X{float(m.group(1)) + current_shift:.5f}",
-                    line,
-                )
-                line = re.sub(
-                    self.re_y,
-                    lambda m: f"Y{float(m.group(1)) + current_shift:.5f}",
-                    line,
-                )
-
             # Extrusion adjustments
             if re.search(r"\bE[0-9]", line):
                 line = self._adjust_extrusion(line, layer_num == total_layers - 1)
