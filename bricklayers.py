@@ -113,6 +113,7 @@ class GCodeProcessor:
         self.extrusion_mode = "absolute"  # Default assumption
         self.total_shifts = 0  # New shift counter
         self.last_e_value = 0.0
+        self.layer_history = []  # Stores tuples of (perimeter_z, non_perimeter_z)
         self.current_z = 0.0  # Track printed Z
         self.max_mem_usage = 0.0  # Peak memory tracking
         self.max_model_z = 0.0
@@ -214,6 +215,9 @@ class GCodeProcessor:
         current_feature = None
         current_z_position = current_z
 
+        # Get previous layer heights
+        prev_perimeter_z, prev_non_perimeter_z = self._get_previous_heights()
+
         # First try to identify blocks by slicer markers
         blocks = self._identify_perimeter_blocks(layer_lines)
 
@@ -240,6 +244,9 @@ class GCodeProcessor:
         for block_lines, feature_type in blocks:
             modifications = {
                 "original_lines": block_lines.copy(),
+                "extrusion_ratio": 1.0,
+                "is_perimeter": self._is_perimeter(feature_type),
+                "prev_non_perimeter_z": prev_non_perimeter_z,
                 "modified_lines": [],
                 "z_height": False,
                 "extrusion": False,
@@ -250,6 +257,16 @@ class GCodeProcessor:
             if self._is_custom_block(feature_type):
                 processed.extend(block_lines)
                 continue
+
+            # Calculate extrusion ratio once per block
+            if modifications["is_perimeter"]:
+                modifications["extrusion_ratio"] = self._calculate_extrusion_ratio(
+                    self.current_z,  # Current perimeter Z
+                    prev_perimeter_z,  # Previous perimeter Z from history
+                )
+                self.logger.debug(
+                    f"Perimeter extrusion ratio: {modifications['extrusion_ratio']:.2f}"
+                )
 
             # Track block statistics
             if feature_type:
@@ -271,7 +288,7 @@ class GCodeProcessor:
                     processed.append(
                         f"; [BRICKLAYER] First layer non-perimeter at 150% height ({target_z:.3f}mm)\n"
                     )
-                else:
+                elif self.current_layer > 0:
                     # Subsequent layers: maintain the offset
                     target_z = current_z + (self.layer_height * 0.5)
                     if abs(target_z - current_z_position) > 0.001:
@@ -286,7 +303,9 @@ class GCodeProcessor:
             for line in block_lines:
                 # Handle Z movements
                 if line.startswith(("G0", "G1")) and "Z" in line:
-                    if modifications["z_height"]:
+                    if modifications["z_height"] and not self._is_perimeter(
+                        feature_type
+                    ):
                         z_match = self.re_z.search(line)
                         if z_match:
                             z_speed = self._calculate_z_speed(
@@ -299,7 +318,7 @@ class GCodeProcessor:
                 # Handle extrusion
                 if line.startswith("G1") and "E" in line:
                     if self.current_layer == 0 and not self._is_perimeter(feature_type):
-                        # Adjust extrusion for first layer height increase
+                        # First layer special handling
                         e_match = self.re_e.search(line)
                         if e_match:
                             original_e = float(e_match.group(1))
@@ -310,13 +329,34 @@ class GCodeProcessor:
                             modifications["extrusion"] = True
                             modifications["extrusion_multiplier"] = 1.5
                             self.block_statistics["total_extrusion_modifications"] += 1
+                    elif self._is_perimeter(feature_type):
+                        # Perimeter extrusion adjustment based on actual Z gap
+                        e_match = self.re_e.search(line)
+                        if e_match:
+                            original_e = float(e_match.group(1))
+                            modified_e = (
+                                original_e
+                                * self.extrusion_multiplier
+                                * modifications["extrusion_ratio"]
+                            )
+                            line = self.re_e_sub.sub(f"E{modified_e:.5f}", line)
+                            modifications["extrusion"] = True
 
                 modified_lines.append(line)
 
-            # Log block details at DEBUG level
+            # store the newly modified lines in modifications
+            modifications["modified_lines"] = modified_lines
+
+            # Log both original and modified lines (in DEBUG level)
             self._log_block_details(block_lines, feature_type, modifications)
 
+            # Add the modified lines to the output
             processed.extend(modified_lines)
+
+        # Record layer heights after processing
+        current_perimeter_z = current_z
+        current_non_perimeter_z = current_z + (self.layer_height * 0.5)
+        self.layer_history.append((current_perimeter_z, current_non_perimeter_z))
 
         return processed
 
@@ -340,6 +380,7 @@ class GCodeProcessor:
                 "outer wall",
                 "inner wall",
                 "support",
+                "support material",  # Explicitly treat support as perimeter
                 "tree",
                 "brim",
                 "overhang",  # Added to include overhang features
@@ -347,6 +388,28 @@ class GCodeProcessor:
                 "skirt/brim",
             ]
         )
+
+    def _get_previous_heights(self):
+        """Get Z heights from previous layer's features"""
+        if not self.layer_history:
+            # First layer defaults
+            if self.layer_height:
+                return (
+                    0.0,
+                    self.layer_height * 0.5,
+                )  # (prev_perimeter_z, prev_non_perimeter_z)
+            return (0.0, 0.0)
+        return self.layer_history[
+            -1
+        ]  # Returns (prev_perimeter_z, prev_non_perimeter_z)
+
+    def _calculate_extrusion_ratio(self, current_z, prev_perimeter_z):
+        """Calculate extrusion scaling based on actual vertical distance"""
+        if prev_perimeter_z == 0:  # First layer case
+            return 1.0
+        actual_z_gap = current_z - prev_perimeter_z
+        nominal_gap = self.layer_height
+        return max(0.5, min(2.0, actual_z_gap / nominal_gap))
 
     def _is_top_layer(self, current_z):
         """Determine if current layer is in top section using Z-height"""
@@ -912,6 +975,12 @@ class GCodeProcessor:
                     if current_block:
                         blocks.append((current_block, current_type))
                         current_block = []
+
+                    # Calculate extrusion ratio for perimeters
+                    extrusion_ratio = self._calculate_extrusion_ratio(
+                        self.current_z, self._get_previous_heights()[1]
+                    )
+
                     current_type = new_type
                     if current_type:
                         current_block.append(
