@@ -1228,23 +1228,27 @@ class GCodeProcessor:
             with open(input_path, "r+") as f:
                 with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
                     with NamedTemporaryFile(mode="w", delete=False) as tmp_file:
-                        # Process header
+                        # Detect the layer change marker
+                        layer_change_marker = {
+                            PrinterType.BAMBU: "; CHANGE_LAYER",
+                            PrinterType.PRUSA: ";LAYER_CHANGE",
+                        }[self.printer_type]
+
+                        # Read all lines until the first layer change into header
                         header_lines = []
                         line = mm.readline()
-                        decoded_line = self.decode_line(line)
-                        while line and (
-                            self._is_header_line(decoded_line)
-                            or not decoded_line.strip()
-                        ):
+                        while line:
+                            decoded_line = self.decode_line(line)
+                            if layer_change_marker in decoded_line:
+                                break
                             header_lines.append(decoded_line)
                             line = mm.readline()
-                            decoded_line = self.decode_line(line)
 
                         # Write header unmodified
                         tmp_file.writelines(header_lines)
 
-                        # Process main content
-                        layer_buffer = []
+                        # Process remaining lines
+                        layer_buffer = [decoded_line]  # Include the layer change line
                         self.current_layer = 0
                         self.current_z = 0.0
                         in_custom_block = False
