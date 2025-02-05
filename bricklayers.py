@@ -209,89 +209,114 @@ class GCodeProcessor:
         return feature_type and "TYPE:Custom" in feature_type
 
     def _process_alternating_blocks(self, layer_lines, current_z):
+        """Process a layer's worth of G-code with bricklaying modifications."""
         processed = []
         current_feature = None
-        base_z = current_z
-        current_z_position = base_z
-        current_block_lines = []
+        current_z_position = current_z
 
-        for line in layer_lines:
-            if line.startswith(";TYPE:"):
-                # Process previous block if it exists
-                if current_block_lines:
-                    # Track block statistics
-                    if current_feature:
-                        self.block_statistics["total_blocks"] += 1
-                        self.block_statistics["by_type"][current_feature] = (
-                            self.block_statistics["by_type"].get(current_feature, 0) + 1
+        # First try to identify blocks by slicer markers
+        blocks = self._identify_perimeter_blocks(layer_lines)
+
+        # If no clear perimeter markers found, use geometric analysis
+        if not any(block[1] for block in blocks):
+            self.logger.debug(
+                f"No slicer perimeter markers found in layer {self.current_layer}, using geometric analysis"
+            )
+            paths = self.parse_perimeter_paths(layer_lines)
+            outer_paths, inner_paths = self.classify_perimeters(paths)
+
+            if outer_paths or inner_paths:
+                self.logger.debug(
+                    f"Geometric analysis found {len(outer_paths)} outer and {len(inner_paths)} inner perimeters"
+                )
+                blocks = self.blocks_from_geometric_classification(
+                    layer_lines, outer_paths, inner_paths
+                )
+            else:
+                self.logger.debug("No perimeters identified through geometric analysis")
+                blocks = [(layer_lines, None)]
+
+        # Process each block
+        for block_lines, feature_type in blocks:
+            modifications = {
+                "original_lines": block_lines.copy(),
+                "modified_lines": [],
+                "z_height": False,
+                "extrusion": False,
+                "extrusion_multiplier": 1.0,
+            }
+
+            # Skip processing for custom blocks
+            if self._is_custom_block(feature_type):
+                processed.extend(block_lines)
+                continue
+
+            # Track block statistics
+            if feature_type:
+                self.block_statistics["total_blocks"] += 1
+                self.block_statistics["by_type"][feature_type] = (
+                    self.block_statistics["by_type"].get(feature_type, 0) + 1
+                )
+
+            # Determine target Z height
+            target_z = current_z
+            if not self._is_perimeter(feature_type):
+                if self.current_layer == 0:
+                    # First layer: Print non-perimeters at 150% height
+                    target_z = current_z + (self.layer_height * 0.5)
+                    modifications["z_height"] = True
+                    modifications["z_delta"] = self.layer_height * 0.5
+                    modifications["new_height"] = target_z
+                    self.block_statistics["first_layer_height_mods"] += 1
+                    processed.append(
+                        f"; [BRICKLAYER] First layer non-perimeter at 150% height ({target_z:.3f}mm)\n"
+                    )
+                else:
+                    # Subsequent layers: maintain the offset
+                    target_z = current_z + (self.layer_height * 0.5)
+                    if abs(target_z - current_z_position) > 0.001:
+                        modifications["z_height"] = True
+                        modifications["z_delta"] = target_z - current_z_position
+                        processed.append(
+                            f"; [BRICKLAYER] Maintaining +{self.layer_height * 0.5:.3f}mm offset\n"
                         )
 
-                    modifications = {
-                        "original_lines": current_block_lines.copy(),
-                        "modified_lines": [],
-                        "z_height": False,
-                        "extrusion": False,
-                    }
-
-                    if not self._is_custom_block(current_feature):
-                        target_z = base_z
-                        if not self._is_perimeter(current_feature):
-                            if self.current_layer == 0:
-                                # First layer: Print non-perimeters at 150% height
-                                target_z = base_z + (self.layer_height * 0.5)
-                                modifications["z_height"] = True
-                                modifications["z_delta"] = self.layer_height * 0.5
-                                modifications["new_height"] = target_z
-                                self.block_statistics["first_layer_height_mods"] += 1
-                                self.block_statistics["total_z_modifications"] += 1
-
-                                # Add descriptive comment
-                                processed.append(
-                                    f"; [BRICKLAYER] First layer non-perimeter at 150% height ({target_z:.3f}mm)\n"
-                                )
-
-                            else:
-                                # Subsequent layers: maintain the offset
-                                target_z = base_z + (self.layer_height * 0.5)
-                                if abs(target_z - current_z_position) > 0.001:
-                                    modifications["z_height"] = True
-                                    modifications["z_delta"] = (
-                                        target_z - current_z_position
-                                    )
-                                    self.block_statistics["total_z_modifications"] += 1
-
-                                    processed.append(
-                                        f"; [BRICKLAYER] Maintaining +{self.layer_height * 0.5:.3f}mm offset\n"
-                                    )
-
-                        if modifications["z_height"]:
+            # Process lines in the block
+            modified_lines = []
+            for line in block_lines:
+                # Handle Z movements
+                if line.startswith(("G0", "G1")) and "Z" in line:
+                    if modifications["z_height"]:
+                        z_match = self.re_z.search(line)
+                        if z_match:
                             z_speed = self._calculate_z_speed(
                                 abs(target_z - current_z_position)
                             )
-                            processed.append(
-                                f"G1 Z{target_z:.3f} F{z_speed:.0f} ; Z adjustment\n"
-                            )
+                            line = f"G1 Z{target_z:.3f} F{z_speed:.0f} ; Z adjustment\n"
                             current_z_position = target_z
+                            self.block_statistics["total_z_modifications"] += 1
 
-                    # Log block details at DEBUG level
-                    self._log_block_details(
-                        current_block_lines, current_feature, modifications
-                    )
+                # Handle extrusion
+                if line.startswith("G1") and "E" in line:
+                    if self.current_layer == 0 and not self._is_perimeter(feature_type):
+                        # Adjust extrusion for first layer height increase
+                        e_match = self.re_e.search(line)
+                        if e_match:
+                            original_e = float(e_match.group(1))
+                            modified_e = (
+                                original_e * 1.5
+                            )  # 150% extrusion for 150% height
+                            line = self.re_e_sub.sub(f"E{modified_e:.5f}", line)
+                            modifications["extrusion"] = True
+                            modifications["extrusion_multiplier"] = 1.5
+                            self.block_statistics["total_extrusion_modifications"] += 1
 
-                    # Add all remaining lines from the block
-                    processed.extend(current_block_lines)
+                modified_lines.append(line)
 
-                # Start new block
-                current_feature = line.strip()
-                current_block_lines = [line]
-                continue
+            # Log block details at DEBUG level
+            self._log_block_details(block_lines, feature_type, modifications)
 
-            current_block_lines.append(line)
-
-        # Process final block
-        if current_block_lines:
-            if not self._is_custom_block(current_feature):
-                processed.extend(current_block_lines)
+            processed.extend(modified_lines)
 
         return processed
 
@@ -767,88 +792,168 @@ class GCodeProcessor:
                 return 0.0
 
     def classify_perimeters(self, perimeter_paths):
-        classified = {"outer": [], "inner": []}
-        unclassified = []
+        """Classify perimeter paths into outer and inner walls using geometric analysis."""
+        if not perimeter_paths:
+            return [], []
 
+        outer_paths = []
+        inner_paths = []
+
+        # Convert paths to Shapely polygons
+        polygons = []
         for poly, lines, ptype in perimeter_paths:
-            if ptype == PerimeterType.OUTER:
-                classified["outer"].append((poly, lines))
-            elif ptype == PerimeterType.INNER:
-                classified["inner"].append((poly, lines))
+            if isinstance(poly, (Polygon, MultiPolygon)):
+                polygons.append((poly, lines, ptype))
+
+        if not polygons:
+            return [], []
+
+        # Create spatial index for efficiency
+        tree = STRtree([p for p, _, _ in polygons])
+
+        # Classify each polygon
+        for idx, (poly, lines, _) in enumerate(polygons):
+            is_inner = False
+
+            # Find potential containing polygons
+            candidates = tree.query(poly)
+            candidates = [polygons[i][0] for i in candidates if i != idx]
+
+            if candidates:
+                # Check if this polygon is contained by any others
+                containing_polys = [
+                    p for p in candidates if p.contains(poly.buffer(-0.01))
+                ]
+
+                if containing_polys:
+                    # If contained by others, this is an inner wall
+                    is_inner = True
+                    # Find the closest containing polygon by area difference
+                    parent = max(containing_polys, key=lambda p: p.area)
+                    area_ratio = poly.area / parent.area
+                    # Verify it's not just a small offset of the outer wall
+                    if area_ratio > 0.95:
+                        is_inner = False
+                else:
+                    # Check for near-coincident walls that might be part of the same feature
+                    nearest = min(candidates, key=lambda p: p.distance(poly))
+                    if poly.distance(nearest) < self.min_distance:
+                        # Compare areas to determine if this is likely part of a multi-wall feature
+                        area_ratio = poly.area / nearest.area
+                        if 0.8 < area_ratio < 1.2:  # Similar sized walls
+                            is_inner = False
+                        else:
+                            is_inner = True
+
+            if is_inner:
+                inner_paths.append((poly, lines))
             else:
-                unclassified.append((poly, lines))
+                outer_paths.append((poly, lines))
 
-        if unclassified and (classified["outer"] or classified["inner"]):
-            outer_polys = [p for p, _ in classified["outer"]]
-            tree = STRtree(outer_polys) if outer_polys else None
-
-            for poly, lines in unclassified:
-                is_inner = False
-                if tree:
-                    candidate_indices = tree.query(poly)
-                    candidates = [outer_polys[i] for i in candidate_indices]
-
-                    containing_outers = [
-                        op for op in candidates if op.contains(poly.buffer(-0.01))
-                    ]
-
-                    if containing_outers:
-                        parent_outer = max(
-                            containing_outers, key=lambda op: op.intersection(poly).area
-                        )
-                        area_ratio = poly.area / parent_outer.area
-                        if area_ratio < 0.75:
-                            intersection = parent_outer.intersection(poly).area
-                            if intersection / poly.area >= 0.95:
-                                is_inner = True
-                    else:
-                        nearest_idx = tree.nearest(poly)
-                        nearest = outer_polys[nearest_idx]
-                        distance = poly.distance(nearest)
-                        if distance < self.min_distance * 0.5:
-                            if poly.area / nearest.area < 0.25:
-                                is_inner = True
-
-                classified["inner" if is_inner else "outer"].append((poly, lines))
-
-        return classified["outer"], classified["inner"]
+        self.logger.debug(
+            f"Geometric classification complete: {len(outer_paths)} outer, {len(inner_paths)} inner paths"
+        )
+        return outer_paths, inner_paths
 
     def blocks_from_geometric_classification(
         self, layer_lines, outer_paths, inner_paths
     ):
-        """Convert geometric analysis results to processing blocks"""
+        """Convert geometric analysis results back into G-code blocks."""
         blocks = []
         current_block = []
         current_type = None
+        in_extrusion_move = False
+
+        # Create lookup dictionaries for quick point-in-polygon testing
+        outer_polys = [poly for poly, _ in outer_paths]
+        inner_polys = [poly for poly, _ in inner_paths]
+        outer_tree = STRtree(outer_polys) if outer_polys else None
+        inner_tree = STRtree(inner_polys) if inner_polys else None
 
         for line in layer_lines:
-            if line.startswith("G1") and "X" in line and "Y" in line:
-                x = float(self.re_x.search(line).group(1))
-                y = float(self.re_y.search(line).group(1))
+            # Always include non-movement commands in current block
+            if not line.startswith(("G0", "G1")):
+                if current_block:
+                    current_block.append(line)
+                continue
 
-                # Check if point belongs to geometric classification
+            # Extract X/Y coordinates from movement commands
+            x_match = self.re_x.search(line)
+            y_match = self.re_y.search(line)
+
+            # If this is an extrusion move (has X/Y and E)
+            if x_match and y_match and "E" in line:
+                x = float(x_match.group(1))
+                y = float(y_match.group(1))
                 point = Point(x, y)
-                is_outer = any(poly.contains(point) for poly, _ in outer_paths)
-                is_inner = any(poly.contains(point) for poly, _ in inner_paths)
 
-                if is_outer:
-                    new_type = ";GEOM_ANALYSIS:Outer perimeter"
-                elif is_inner:
-                    new_type = ";GEOM_ANALYSIS:Inner perimeter"
-                else:
-                    new_type = None
+                # Determine point type using spatial index
+                new_type = None
+                if outer_tree:
+                    potential_outers = [
+                        i
+                        for i in outer_tree.query(point)
+                        if outer_polys[i].contains(point)
+                    ]
+                    if potential_outers:
+                        new_type = ";TYPE:External perimeter"
 
+                if not new_type and inner_tree:
+                    potential_inners = [
+                        i
+                        for i in inner_tree.query(point)
+                        if inner_polys[i].contains(point)
+                    ]
+                    if potential_inners:
+                        new_type = ";TYPE:Internal perimeter"
+
+                # If point type changed, start new block
                 if new_type != current_type:
                     if current_block:
                         blocks.append((current_block, current_type))
                         current_block = []
                     current_type = new_type
+                    if current_type:
+                        current_block.append(
+                            f"{current_type} ; [BRICKLAYER] Geometrically classified\n"
+                        )
 
-            current_block.append(line)
+                in_extrusion_move = True
 
+            else:
+                # For non-extrusion moves, only close block if we were in an extrusion move
+                if in_extrusion_move:
+                    if current_block:
+                        blocks.append((current_block, current_type))
+                        current_block = []
+                    current_type = None
+                    in_extrusion_move = False
+
+            # Add the current line to whatever block we're building
+            if current_type or not in_extrusion_move:
+                current_block.append(line)
+
+        # Don't forget the last block
         if current_block:
             blocks.append((current_block, current_type))
 
+        # Handle any lines that didn't fit into perimeter blocks
+        unclassified_lines = []
+        for lines, type_ in blocks:
+            if not type_:
+                unclassified_lines.extend(lines)
+
+        if unclassified_lines:
+            self.logger.debug(f"Found {len(unclassified_lines)} unclassified lines")
+            # Add unclassified lines as a separate block
+            blocks.append(
+                (
+                    unclassified_lines,
+                    ";TYPE:Internal infill ; [BRICKLAYER] Unclassified geometry",
+                )
+            )
+
+        self.logger.debug(f"Created {len(blocks)} blocks from geometric classification")
         return blocks
 
     def _adjust_top_layers(self):
@@ -1073,7 +1178,21 @@ class GCodeProcessor:
                 input_path = input_path.with_suffix(".gcode")
                 os.system(f"bgcode decode {input_file} -o {input_path}")
 
-            # First pass: Detect file characteristics
+            # First detect printer type and basic characteristics
+            self.printer_type = self.detect_printer_type(input_path)
+            self.layer_height = self.layer_height or self.detect_layer_height(
+                input_path
+            )
+            self.z_speed = self.z_speed or self.detect_z_speed(input_path)
+            self.z_shift = self.layer_height * 0.5
+
+            # Log initial detection
+            self.logger.info(f"Detected printer type: {self.printer_type}")
+            self.logger.info(
+                f"Layer height: {self.layer_height:.3f}mm ({self.layer_height_source})"
+            )
+
+            # Now detect file characteristics
             self.logger.info("Analyzing file characteristics...")
             with open(input_path, "r+") as f:
                 with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
@@ -1089,7 +1208,7 @@ class GCodeProcessor:
 
                     mm.seek(0)
 
-                    # Count total layers
+                    # Count total layers using correct marker for detected printer type
                     layer_change_marker = {
                         PrinterType.BAMBU: "; CHANGE_LAYER",
                         PrinterType.PRUSA: ";LAYER_CHANGE",
@@ -1101,20 +1220,7 @@ class GCodeProcessor:
                         if layer_change_marker in self.decode_line(line)
                     )
 
-            # Detect printer characteristics
-            self.printer_type = self.detect_printer_type(input_path)
-            self.layer_height = self.layer_height or self.detect_layer_height(
-                input_path
-            )
-            self.z_speed = self.z_speed or self.detect_z_speed(input_path)
-            self.z_shift = self.layer_height * 0.5
-
-            # Log initial information
-            self.logger.info(f"Processing file: {input_path}")
-            self.logger.info(f"Printer type: {self.printer_type}")
-            self.logger.info(
-                f"Layer height: {self.layer_height:.3f}mm ({self.layer_height_source})"
-            )
+            # Log file characteristics
             self.logger.info(f"Maximum Z height: {self.max_model_z:.2f}mm")
             self.logger.info(f"Total layers: {self.total_layers}")
 
