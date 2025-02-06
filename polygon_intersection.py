@@ -7,8 +7,9 @@ import socket
 import logging
 import argparse
 import concurrent.futures
-from datetime import datetime
+from datetime import datetime, timezone
 from shapely.geometry import Polygon, Point as ShapelyPoint, MultiPoint, box
+import math
 
 # Pre-compile regex patterns as class attributes.
 RE_LAYER_Z = re.compile(r"Z([\d\.]+)")
@@ -31,7 +32,11 @@ class RFC5424Formatter(logging.Formatter):
         pid = record.process
         # For PRI, we use a fixed dummy value (14) based on severity.
         pri = "<14>"
-        timestamp = datetime.utcfromtimestamp(record.created).isoformat() + "Z"
+        timestamp = (
+            datetime.fromtimestamp(record.created, timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
         version = "1"
         msgid = "-"
         message = record.getMessage()
@@ -254,28 +259,92 @@ class BricklayeringProcessor:
         return bbox, poly
 
     # -------------------------------------------------------------------------#
+    # Merge two regions by combining their coordinate lists. Build a new bbox and polygon.
+    # -------------------------------------------------------------------------#
+    def merge_two_regions(self, region1, region2):
+        merged_coords = region1.get("coords", []) + region2.get("coords", [])
+        bbox, poly = self.build_polygon(merged_coords)
+        merged_region = {"bbox": bbox, "polygon": poly, "coords": merged_coords}
+        return merged_region
+
+    # -------------------------------------------------------------------------#
+    # Check if two bounding boxes are sufficiently close or overlapping.
+    # Adjust tolerance as needed (in mm).
+    # -------------------------------------------------------------------------#
+    def bboxes_are_close(self, bbox1, bbox2, tolerance=0.01):
+        minx1, miny1, maxx1, maxy1 = bbox1
+        minx2, miny2, maxx2, maxy2 = bbox2
+        # They are far apart if one is completely to the left/right or above/below the other minus a tolerance.
+        if maxx1 < (minx2 - tolerance) or maxx2 < (minx1 - tolerance):
+            return False
+        if maxy1 < (miny2 - tolerance) or maxy2 < (miny1 - tolerance):
+            return False
+        return True
+
+    # -------------------------------------------------------------------------#
+    # After processing a layer, merge adjacent regions that have overlapping (or close) bounding boxes.
+    # -------------------------------------------------------------------------#
+    def merge_adjacent_regions(self, layer):
+        regions = self.layer_infill_regions.get(layer, [])
+        if not regions:
+            return
+        merged = []
+        for region in regions:
+            if not merged:
+                merged.append(region)
+            else:
+                last_region = merged[-1]
+                if self.bboxes_are_close(last_region["bbox"], region["bbox"]):
+                    new_region = self.merge_two_regions(last_region, region)
+                    merged[-1] = new_region
+                    logging.debug(
+                        "Merged two regions on layer %d; new bbox: %s",
+                        layer,
+                        new_region["bbox"],
+                    )
+                else:
+                    merged.append(region)
+        self.layer_infill_regions[layer] = merged
+
+    # -------------------------------------------------------------------------#
     # Finalize the current non-perimeter infill region.
     # If parallel processing is enabled, submit the polygon building to the thread pool.
+    # Modified here: we save the raw collected coordinates in the region dictionary.
+    # Also, if the number of collected points is less than a threshold, merge them with the preceding region.
     # -------------------------------------------------------------------------#
     def finalize_current_infill_region(self):
         if not self.current_infill_coords:
             return
 
-        if self.parallel_processing and self.pool:
-            future = self.pool.submit(
-                self.build_polygon, self.current_infill_coords.copy()
-            )
-            try:
-                bbox, poly = future.result(timeout=10)
-            except Exception as e:
-                logging.error("Parallel polygon construction failed: %s", e)
-                bbox = self.compute_bbox(self.current_infill_coords)
-                poly = box(*bbox)
-        else:
-            bbox, poly = self.build_polygon(self.current_infill_coords)
+        coords = self.current_infill_coords.copy()
 
-        region = {"bbox": bbox, "polygon": poly}
-        self.layer_infill_regions.setdefault(self.current_layer, []).append(region)
+        # If too few points are collected, attempt to merge with the last finalized region
+        if len(coords) < 3:
+            if (
+                self.current_layer in self.layer_infill_regions
+                and self.layer_infill_regions[self.current_layer]
+            ):
+                last_region = self.layer_infill_regions[self.current_layer][-1]
+                merged_region = self.merge_two_regions(last_region, {"coords": coords})
+                # Replace the last region with the merged one.
+                self.layer_infill_regions[self.current_layer][-1] = merged_region
+                logging.info(
+                    "Merged a very small region (only %d points) with the previous region on layer %d.",
+                    len(coords),
+                    self.current_layer,
+                )
+            else:
+                # Not much to merge with; build the region anyway.
+                bbox, poly = self.build_polygon(coords)
+                region = {"bbox": bbox, "polygon": poly, "coords": coords}
+                self.layer_infill_regions.setdefault(self.current_layer, []).append(
+                    region
+                )
+        else:
+            bbox, poly = self.build_polygon(coords)
+            region = {"bbox": bbox, "polygon": poly, "coords": coords}
+            self.layer_infill_regions.setdefault(self.current_layer, []).append(region)
+
         logging.info(
             "Finalized infill region on layer %d; now %d region(s) on this layer.",
             self.current_layer,
@@ -283,6 +352,9 @@ class BricklayeringProcessor:
         )
         self.current_infill_coords = []
         self.pending_z_shift = False
+
+        # Optionally, merge adjacent regions for this layer after each finalization.
+        self.merge_adjacent_regions(self.current_layer)
 
     # -------------------------------------------------------------------------#
     # Check if the point (x,y) is inside any infill region from the previous layer.
@@ -332,7 +404,11 @@ class BricklayeringProcessor:
                     self.finalize_current_infill_region()
                 self.current_z = z_val
                 self.current_layer = new_layer
-                logging.info("Layer change via comment: now at layer %d (Z=%.3f)", new_layer, z_val)
+                logging.info(
+                    "Layer change via comment: now at layer %d (Z=%.3f)",
+                    new_layer,
+                    z_val,
+                )
             except Exception as e:
                 logging.error("Error parsing layer Z from comment: %s", e)
             output.append(line)
@@ -350,7 +426,6 @@ class BricklayeringProcessor:
             # Note: Do not update internal layer state here.
             # (Genuine layer changes should be handled via the comments.)
             return output
-
 
         # if line.startswith("G1 ") and "Z" in line:
         #     logging.debug("Processing Z move: %s", line.strip())
@@ -388,10 +463,15 @@ class BricklayeringProcessor:
         # Detect special comments.
         if line.startswith(";TYPE:"):
             section_type = line.split(":")[-1].strip()
-            new_section = ("non_perimeter" if section_type in self.non_perimeter_types
-                        else "perimeter")
+            new_section = (
+                "non_perimeter"
+                if section_type in self.non_perimeter_types
+                else "perimeter"
+            )
             if new_section != self.current_section:
-                logging.info("Section change: %s -> %s", self.current_section, new_section)
+                logging.info(
+                    "Section change: %s -> %s", self.current_section, new_section
+                )
                 self.handle_section_change(new_section, output)
                 self.current_section = new_section
 
@@ -410,7 +490,9 @@ class BricklayeringProcessor:
                     x_val = float(m_x.group(1))
                     y_val = float(m_y.group(1))
                     base_z = self.current_layer * self.layer_height
-                    if self.current_layer >= 2 and self._previous_infill_at(x_val, y_val):
+                    if self.current_layer >= 2 and self._previous_infill_at(
+                        x_val, y_val
+                    ):
                         new_z = base_z + self.infill_offset
                         note = "Aligned with infill: raising Z"
                     else:
@@ -418,8 +500,14 @@ class BricklayeringProcessor:
                         note = "No underlying infill: Z unchanged"
                     out_line = f"G1 Z{new_z:.3f} F9000 ; {note} ;TEMP_Z\n"
                     output.append(out_line)
-                    logging.info("Layer %d non-perimeter: first XY (%.3f, %.3f) => %s (Z=%.3f)",
-                                self.current_layer, x_val, y_val, note, new_z)
+                    logging.info(
+                        "Layer %d non-perimeter: first XY (%.3f, %.3f) => %s (Z=%.3f)",
+                        self.current_layer,
+                        x_val,
+                        y_val,
+                        note,
+                        new_z,
+                    )
                     self.pending_z_shift = False
 
             m_x = RE_LAYER_X.search(line)
@@ -432,10 +520,14 @@ class BricklayeringProcessor:
 
         if "E" in line and "G1" in line:
             old_line = line.strip()
-            line = self.adjust_extrusion(line)
-            if old_line != line.strip():
-                logging.debug("Extrusion adjusted: '%s' -> '%s'", old_line, line.strip())
-            line = line.rstrip("\n") + " ; extrusion adjusted\n"
+            new_line = self.adjust_extrusion(line)
+            if old_line != new_line.strip():
+                logging.debug(
+                    "Extrusion adjusted: '%s' -> '%s'", old_line, new_line.strip()
+                )
+                line = new_line.rstrip("\n") + " ; extrusion adjusted\n"
+            else:
+                line = new_line
 
         output.append(line)
         return output
@@ -478,6 +570,8 @@ class BricklayeringProcessor:
     # otherwise overall_extrusion_multiplier.
     # -------------------------------------------------------------------------#
     def adjust_extrusion(self, line):
+        """Adjust the extrusion value in G-code if necessary,
+        leaving the line unchanged if the result is numerically identical."""
         m = RE_LAYER_E.search(line)
         if not m:
             return line
@@ -485,14 +579,30 @@ class BricklayeringProcessor:
             e_val = float(m.group(1))
         except ValueError:
             return line
-        if self.current_layer == 1:
+
+        # Determine the extrusion multiplier based on layer and section.
+        if self.current_layer == 1 and self.current_section == "perimeter":
+            multiplier = 1.0  # Do not adjust first-layer perimeter moves.
+        elif self.current_layer == 1:
             multiplier = self.first_layer_extrusion_multiplier
         elif self.current_last_layer:
             multiplier = self.last_layer_extrusion_multiplier
         else:
             multiplier = self.overall_extrusion_multiplier
+
+        # If the multiplier is effectively 1.0, then no adjustment is needed.
+        if math.isclose(multiplier, 1.0, rel_tol=1e-9):
+            return line
+
         new_e = e_val * multiplier
+
+        # If the new extrusion value is numerically the same as the original, do nothing.
+        if math.isclose(new_e, e_val, rel_tol=1e-9):
+            return line
+
+        # Otherwise, perform the replacement.
         new_line = re.sub(r"E[\d\.]+", f"E{new_e:.5f}", line)
+        new_line = new_line.rstrip("\n") + " ; extrusion adjusted\n"
         return new_line
 
     # -------------------------------------------------------------------------#
