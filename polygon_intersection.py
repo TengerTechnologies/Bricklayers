@@ -40,11 +40,89 @@ This hybrid/adaptive approach accurately detects complex infill regions and prop
 overextrusion offset upward while maintaining flat top surface.
 """
 
+#!/usr/bin/env python3
 import re
 import sys
+import os
 import logging
 import argparse
+from datetime import datetime
 from shapely.geometry import Polygon, Point as ShapelyPoint, MultiPoint
+
+
+def setup_logging(level_str):
+    """
+    Create (if necessary) a 'logs' subdirectory relative to this script, and configure
+    logging to write to a timestamped log file with the provided log level.
+    """
+    # Determine numeric logging level from the string.
+    numeric_level = getattr(logging, level_str.upper(), None)
+    if not isinstance(numeric_level, int):
+        raise ValueError(f"Invalid log level: {level_str}")
+
+    # Find the directory where this script is located.
+    script_dir = os.path.dirname(os.path.realpath(__file__))
+    log_dir = os.path.join(script_dir, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_filename = os.path.join(log_dir, f"bricklayer_{timestamp}.log")
+
+    # Set up logging: output to both file and console.
+    logging.basicConfig(
+        level=numeric_level,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        handlers=[
+            logging.FileHandler(log_filename, mode="a"),
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
+    logging.info(
+        "Logging initialized at level %s. Log file: %s", level_str.upper(), log_filename
+    )
+
+
+def auto_detect_layer_height(file_path):
+    """
+    Automatically detect the layer height by scanning the G-code file for G1 commands
+    containing 'Z' moves. It collects unique Z values, then computes the smallest positive
+    difference between consecutive values as the presumed layer height.
+    """
+    z_values = set()
+    try:
+        with open(file_path, "r") as infile:
+            for line in infile:
+                if line.startswith("G1 ") and "Z" in line:
+                    z_match = re.search(r"Z([\d\.]+)", line)
+                    if z_match:
+                        try:
+                            z_val = float(z_match.group(1))
+                            z_values.add(round(z_val, 5))
+                        except ValueError:
+                            continue
+    except Exception as e:
+        logging.error("Error reading file for auto-detection: %s", e)
+        return None
+
+    if len(z_values) < 2:
+        logging.error("Not enough distinct Z values found for auto-detection.")
+        return None
+
+    sorted_z = sorted(z_values)
+    logging.debug("Unique Z values detected: %s", sorted_z)
+    differences = [
+        round(sorted_z[i + 1] - sorted_z[i], 5)
+        for i in range(len(sorted_z) - 1)
+        if round(sorted_z[i + 1] - sorted_z[i], 5) > 0
+    ]
+    if not differences:
+        logging.error(
+            "Failed to compute layer height differences; differences list is empty."
+        )
+        return None
+
+    layer_height = min(differences)
+    logging.info("Auto-detected layer height: %.3f mm", layer_height)
+    return layer_height
 
 
 class BricklayeringProcessor:
@@ -71,56 +149,83 @@ class BricklayeringProcessor:
             "Bridge infill",
         }
 
-        # For first layer non-perimeter, we want to overextrude.
-        # For example, a multiplier of 1.5 means that although our nominal layer height is 0.2 mm,
-        # non-perimeter extrusions are printed 1.5× thicker (0.3 mm) so that the extra 0.1 mm
-        # is propagated upward in layers where infill occurs.
+        # Settings for first-layer non-perimeter adjustments.
         self.first_layer_infill_multiplier = 1.5
         self.infill_offset = (
             self.first_layer_infill_multiplier - 1.0
         ) * self.layer_height
+        logging.info(
+            "First-layer multiplier: %.2f, Infill offset: %.3f mm",
+            self.first_layer_infill_multiplier,
+            self.infill_offset,
+        )
 
-        # For each layer, we store a list of infill region data.
-        # Each region is a dict with keys "bbox" (minx,miny,maxx,maxy) and "polygon" (a shapely Polygon)
+        # Infill geometry storage by layer.
+        # Each entry is a dict with keys: "bbox": (minx, miny, maxx, maxy) and "polygon": a shapely Polygon.
         self.layer_infill_regions = {}
-        # For the current non-perimeter region, we collect (X,Y) points.
         self.current_infill_coords = []
-        # In layers 2+, when entering a new non-perimeter section we wait for the first move with XY
-        # data so we can test whether the region below had been overextruded.
         self.pending_z_shift = False
 
     def compute_bbox(self, coords):
-        """Given a list of (x, y) points, compute the bounding box: (minx, miny, maxx, maxy)."""
+        """Compute bounding box (minx, miny, maxx, maxy) for a list of (x, y) points."""
         xs = [pt[0] for pt in coords]
         ys = [pt[1] for pt in coords]
-        return (min(xs), min(ys), max(xs), max(ys))
+        bbox = (min(xs), min(ys), max(xs), max(ys))
+        logging.debug("Computed bbox: %s for %d points", bbox, len(coords))
+        return bbox
 
     def finalize_current_infill_region(self):
-        """Finalize the geometry for the current non-perimeter (infill) region.
-
-        Build a bounding box and a shapely Polygon from the XY coordinates and store them by layer.
-        Afterwards, clear the collected coordinates and reset pending_z_shift.
+        """
+        Build the bounding box and polygon for the current non-perimeter region and store it.
+        If there are insufficient points (< 3) to form a valid polygon, fall back to using the bounding box.
         """
         if not self.current_infill_coords:
             return
+
+        # Always compute the bounding box.
         bbox = self.compute_bbox(self.current_infill_coords)
-        try:
-            poly = Polygon(self.current_infill_coords)
-            if not poly.is_valid:
-                # Fall back to the convex hull for self-intersecting polygons.
-                poly = MultiPoint(self.current_infill_coords).convex_hull
-        except Exception as e:
-            logging.error("Error creating polygon: %s", e)
-            poly = None
+
+        # If there are fewer than 3 points, we cannot create a valid polygon.
+        if len(self.current_infill_coords) < 3:
+            logging.warning(
+                "Insufficient points (%d) for region on layer %d; using bbox as polygon.",
+                len(self.current_infill_coords),
+                self.current_layer,
+            )
+            from shapely.geometry import box
+
+            poly = box(*bbox)
+        else:
+            try:
+                poly = Polygon(self.current_infill_coords)
+                # If not valid or zero area, try a convex hull; if still not a Polygon, fall back to bbox.
+                if not poly.is_valid or poly.area == 0:
+                    logging.debug("Polygon invalid or zero area; using convex hull.")
+                    poly = MultiPoint(self.current_infill_coords).convex_hull
+                    if poly.geom_type != "Polygon":
+                        from shapely.geometry import box
+
+                        poly = box(*bbox)
+            except Exception as e:
+                logging.error("Error creating polygon: %s", e)
+                from shapely.geometry import box
+
+                poly = box(*bbox)
+
         region = {"bbox": bbox, "polygon": poly}
         self.layer_infill_regions.setdefault(self.current_layer, []).append(region)
+        logging.info(
+            "Finalized infill region on layer %d; now %d region(s) on this layer.",
+            self.current_layer,
+            len(self.layer_infill_regions[self.current_layer]),
+        )
         self.current_infill_coords = []
         self.pending_z_shift = False
 
     def _previous_infill_at(self, x, y):
         """
-        Check if the (x, y) point lies within any non-perimeter (infill) region of the previous layer.
-        This uses a fast bounding box check first, then a polygon intersection test.
+        Check if a given (x, y) point lies within any infill region on the previous layer.
+        Uses a fast bounding box test, then checks the full polygon.
         """
         prev_layer = self.current_layer - 1
         if prev_layer < 1:
@@ -129,19 +234,26 @@ class BricklayeringProcessor:
         test_point = ShapelyPoint(x, y)
         for region in regions:
             minx, miny, maxx, maxy = region["bbox"]
-            # Quick rejection if the point is not inside the bounding box.
             if not (minx <= x <= maxx and miny <= y <= maxy):
                 continue
             poly = region["polygon"]
             if poly is not None and poly.contains(test_point):
+                logging.debug(
+                    "Point (%.3f, %.3f) inside region bbox %s.", x, y, region["bbox"]
+                )
                 return True
+        logging.debug(
+            "Point (%.3f, %.3f) not contained in any region on previous layer %d.",
+            x,
+            y,
+            prev_layer,
+        )
         return False
 
     def process_line(self, line):
         output = []
 
-        # --- Detect layer changes via G1 Z movements ---
-        # When a new layer is started, finalize any pending non-perimeter geometry.
+        # Detect layer changes via G1 Z moves.
         if line.startswith("G1 ") and "Z" in line:
             z_match = re.search(r"Z([\d\.]+)", line)
             if z_match:
@@ -152,19 +264,23 @@ class BricklayeringProcessor:
                         self.finalize_current_infill_region()
                     self.current_z = new_z
                     self.current_layer = new_layer
-                    logging.debug(
-                        "Layer update: %d, Z=%.3f", self.current_layer, self.current_z
+                    logging.info(
+                        "Layer change: now at layer %d (Z=%.3f)",
+                        self.current_layer,
+                        self.current_z,
                     )
                 else:
                     self.current_z = new_z
 
-        # --- Process extrusion mode commands ---
+        # Update extrusion mode.
         if line.startswith("M82"):
             self.extrusion_mode = "absolute"
+            logging.debug("Switched extrusion mode: absolute.")
         elif line.startswith("M83"):
             self.extrusion_mode = "relative"
+            logging.debug("Switched extrusion mode: relative.")
 
-        # --- Handle section/type change comments from the slicer ---
+        # Process slicer comment to check section type.
         if line.startswith(";TYPE:"):
             section_type = line.split(":")[-1].strip()
             new_section = (
@@ -173,13 +289,16 @@ class BricklayeringProcessor:
                 else "perimeter"
             )
             if new_section != self.current_section:
+                logging.info(
+                    "Section change detected: %s -> %s",
+                    self.current_section,
+                    new_section,
+                )
                 self.handle_section_change(new_section, output)
                 self.current_section = new_section
 
-        # --- Process non-perimeter (infill) moves ---
+        # Process non-perimeter (infill) moves.
         if line.startswith("G1 ") and self.current_section == "non_perimeter":
-            # For layers 2 and above, if just beginning a non-perimeter region,
-            # use the first XY move to decide whether to apply a z shift.
             if self.pending_z_shift:
                 x_match = re.search(r"X([\d\.]+)", line)
                 y_match = re.search(r"Y([\d\.]+)", line)
@@ -190,122 +309,165 @@ class BricklayeringProcessor:
                     if self.current_layer >= 2 and self._previous_infill_at(
                         x_val, y_val
                     ):
-                        # Raise the infill moves above the underlying overextruded region.
                         new_z = base_z + self.infill_offset
-                        note = "Aligned with infill below: Z-shift applied"
+                        note = "Aligned with infill: raising Z"
                     else:
                         new_z = base_z
-                        note = "No aligned infill below: no Z-shift"
+                        note = "No underlying infill: no Z shift"
                     output.append(f"G1 Z{new_z:.3f} F9000 ; {note}\n")
+                    logging.info(
+                        "Layer %d non-perimeter: first XY (%.3f, %.3f) => %s (Z set to %.3f)",
+                        self.current_layer,
+                        x_val,
+                        y_val,
+                        note,
+                        new_z,
+                    )
                     self.pending_z_shift = False
 
-            # Collect XY coordinates for building the region's geometry.
+            # Gather XY point coordinates.
             x_match = re.search(r"X([\d\.]+)", line)
             y_match = re.search(r"Y([\d\.]+)", line)
             if x_match and y_match:
                 x_val = float(x_match.group(1))
                 y_val = float(y_match.group(1))
                 self.current_infill_coords.append((x_val, y_val))
+                logging.debug(
+                    "Collected XY point for infill region: (%.3f, %.3f)", x_val, y_val
+                )
 
-        # --- Process extrusion moves for the first layer non-perimeter ---
+        # Adjust extrusion for first-layer non-perimeter moves.
         if (
             "E" in line
             and self.current_section == "non_perimeter"
             and self.current_layer == 1
         ):
+            old_line = line
             line = self.adjust_extrusion(line)
+            logging.debug(
+                "Adjusted first-layer extrusion: '%s' -> '%s'",
+                old_line.strip(),
+                line.strip(),
+            )
 
         output.append(line)
         return output
 
     def handle_section_change(self, new_section, output):
         """
-        When switching sections (for example, leaving non-perimeter infill to a perimeter region),
-        finalize the current infill geometry. Also, if exiting an overextruded region in layers
-        2+ (or the top layer), output a command to reset to the nominal (perimeter) z height so that
-        the visible surface remains flat.
+        When switching sections (for example, leaving non-perimeter infill), finalize the current
+        infill region and, if appropriate, output a command to reset Z to the nominal perimeter height.
         """
         base_z = self.current_layer * self.layer_height
         if self.current_layer < 1:
             return
 
-        # If leaving a non-perimeter (infill) region.
         if self.current_section == "non_perimeter" and new_section == "perimeter":
             if self.current_infill_coords:
                 self.finalize_current_infill_region()
             if self.current_layer >= 2:
-                # Reset z back to the nominal perimeter height.
-                output.append(f"G1 Z{base_z:.3f} F9000 ; Reset to perimeter height\n")
-        # When entering a non-perimeter region:
+                output.append(
+                    f"G1 Z{base_z:.3f} F9000 ; Reset to nominal perimeter height\n"
+                )
+                logging.info(
+                    "Reset Z to nominal perimeter height on layer %d",
+                    self.current_layer,
+                )
         elif new_section == "non_perimeter":
             if self.current_layer == 1:
-                logging.debug("First layer non-perimeter; extrusion adjusted only")
+                logging.info(
+                    "Entering first-layer non-perimeter; using extrusion adjustment only."
+                )
             elif self.current_layer >= 2:
-                # For a new infill region in later layers, trigger a z–test on the first XY move.
                 self.pending_z_shift = True
+                logging.info(
+                    "Entering non-perimeter on layer %d; awaiting first XY for Z test.",
+                    self.current_layer,
+                )
 
     def adjust_extrusion(self, line):
         """
-        For the first layer's non-perimeter moves, scale the extrusion value so that the extruded
-        plastic is thicker (e.g. 150%). This is done only on the first layer so that the buildplate
-        (bottom) stays flat.
+        For first-layer non-perimeter moves, adjust the extrusion value to print a thicker layer.
+        This extra material is propagated upward and later reset so that both the bottom and top surfaces remain flat.
         """
         e_match = re.search(r"E([\d\.]+)", line)
         if not e_match:
             return line
-        e_value = float(e_match.group(1))
+        try:
+            e_value = float(e_match.group(1))
+        except ValueError:
+            return line
         new_e = e_value * self.first_layer_infill_multiplier
         return re.sub(r"E[\d\.]+", f"E{new_e:.5f}", line)
 
     def process_file(self, input_path, output_path):
         processed_lines = []
         with open(input_path, "r") as infile:
-            for line in infile:
+            lines = infile.readlines()
+            logging.info("Opened file: %s (%d lines)", input_path, len(lines))
+            for line in lines:
                 processed = self.process_line(line)
                 processed_lines.extend(processed)
 
-        # --- Finalize the top layer.
-        # If we end in a non-perimeter region, then output a final reset command so that the top
-        # surface is flat.
+        # Top-layer adjustment: if ending within a non-perimeter region, reset Z.
         if self.current_section == "non_perimeter":
             base_z = self.current_layer * self.layer_height
             processed_lines.append(
-                f"G1 Z{base_z:.3f} F9000 ; Reset top layer to perimeter height\n"
+                f"G1 Z{base_z:.3f} F9000 ; Reset top layer to nominal perimeter height\n"
             )
-            # Finalize any remaining infill region geometry
+            logging.info(
+                "Reset top layer Z to nominal perimeter height on layer %d",
+                self.current_layer,
+            )
             if self.current_infill_coords:
                 self.finalize_current_infill_region()
 
         with open(output_path, "w") as outfile:
             outfile.writelines(processed_lines)
+        logging.info("Processed G-code file written to: %s", output_path)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Bricklayering GCode Post-Processor with Hybrid Geometry and Adaptive Z-Shift"
+        description="Bricklayering GCode Post-Processor with Hybrid Geometry, Auto Layer-Height Detection, and Enhanced Logging"
     )
     parser.add_argument(
         "gcode_file", help="Path to the G-code file generated by PrusaSlicer"
     )
     parser.add_argument(
-        "--layer-height", type=float, required=True, help="Layer height in mm"
+        "--layer-height",
+        type=float,
+        default=None,
+        help="Layer height in mm. If not provided, the script will auto-detect it.",
+    )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        help="Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)",
     )
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-        filename="bricklayer.log",
-        filemode="a",
-    )
+    setup_logging(args.log_level)
+
+    # Determine layer height automatically if not provided.
+    if args.layer_height is None:
+        logging.info("Layer height not provided; attempting auto-detection.")
+        detected_layer_height = auto_detect_layer_height(args.gcode_file)
+        if detected_layer_height is None:
+            logging.error("Failed to auto-detect layer height. Exiting.")
+            sys.exit(1)
+        args.layer_height = detected_layer_height
+
+    logging.info("Using layer height: %.3f mm", args.layer_height)
 
     try:
         processor = BricklayeringProcessor(layer_height=args.layer_height)
-        # Process the G-code file.
+        # Process the file, overwriting the input file (or specify a separate output as needed).
         processor.process_file(args.gcode_file, args.gcode_file)
-        logging.info("Successfully processed %s", args.gcode_file)
+        logging.info("Successfully processed file: %s", args.gcode_file)
     except Exception as e:
-        logging.error("Failed to process file: %s", str(e))
+        logging.error("Processing failed: %s", str(e))
         sys.exit(1)
 
 
