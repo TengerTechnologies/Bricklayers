@@ -525,7 +525,7 @@ class BricklayeringProcessor:
                 logging.debug(
                     "Extrusion adjusted: '%s' -> '%s'", old_line, new_line.strip()
                 )
-                line = new_line.rstrip("\n") + " ; extrusion adjusted\n"
+                line = new_line
             else:
                 line = new_line
 
