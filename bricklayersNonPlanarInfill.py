@@ -91,7 +91,7 @@ def process_nonplanar_infill(lines, current_z, amplitude, frequency, solid_infil
                 current_z = float(z_match.group(1))
                 update_layer_bounds(current_z)
 
-        if ';TYPE:Internal infill' in line:
+        if ';TYPE:Internal infill' in line or ';TYPE:Sparse infill' in line:
             in_infill = True
             modified_lines.append(line)
             continue
@@ -100,14 +100,14 @@ def process_nonplanar_infill(lines, current_z, amplitude, frequency, solid_infil
 
         if in_infill and line_num not in processed_indices and line.startswith('G1') and 'E' in line:
             processed_indices.add(line_num)
-            match = re.search(r'X([-+]?\d*\.?\d+)\s*Y([-+]?\d*\.?\d+)\s*E([-+]?\d*\.?\d+)', line)
+            match = re.search(r'X([-+]?\d*\.\d+|\d+).*?Y([-+]?\d*\.\d+|\d+).*?E([-+]?\d*\.\d+|\d+)', line)
             if match:
                 x1, y1, e = map(float, match.groups())
                 next_line_index = line_num + 1
                 
                 if next_line_index < len(lines):
                     next_line = lines[next_line_index]
-                    next_match = re.search(r'X([-+]?\d*\.?\d+)\s*Y([-+]?\d*\.?\d+)', next_line)
+                    next_match = re.search(r'X([-+]?\d*\.\d+|\d+).*?Y([-+]?\d*\.\d+|\d+)', next_line)
                     if next_match:
                         x2, y2 = map(float, next_match.groups())
                         segments = segment_line(x1, y1, x2, y2, SEGMENT_LENGTH)
@@ -191,7 +191,7 @@ def process_wall_shifting(lines, layer_height, extrusion_multiplier, enable_wall
             inside_perimeter_block = False
             logging.info(f"External perimeter detected at layer {current_layer}")
             modified_lines.append(line)
-        elif ";TYPE:Perimeter" in line or ";TYPE:Inner wall" in line:
+        elif ";TYPE:Perimeter" in line or ";TYPE:Internal perimeter" in line or ";TYPE:Inner wall" in line:
             perimeter_type = "internal"
             inside_perimeter_block = False
             if enable_wall_reorder:
@@ -348,7 +348,7 @@ def process_gcode(input_file, extrusion_multiplier, enable_nonplanar=False, enab
                 z_match = re.search(r'Z([-+]?\d*\.?\d+)', line)
                 if z_match:
                     current_z = float(z_match.group(1))
-            if ';TYPE:Solid infill' in line:
+            if ';TYPE:Solid infill' in line or ';TYPE:Internal solid infill' in line:
                 solid_infill_heights.append(current_z)
                 logging.info(f"Found solid infill at Z={current_z}")
 
