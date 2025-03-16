@@ -18,7 +18,7 @@ The extrusionmultiplier multiplies the extrusions of the shifted layers so you c
 
 Sample: 
 
-```"C:\Your\Path\To\Python\python.exe" "C:\Your\Path\To\Script\bricklayers.py" -layerheight 0.2 -extrusionMultiplier 1.3```
+```"C:\Your\Path\To\Python\python.exe" "C:\Your\Path\To\Script\bricklayers.py" -layerHeight 0.2 -extrusionMultiplier 1.3```
 
 Thanks to all of you who opened issues and made pullrequests. I'm not ignoring you, I just didn't have the time to review yet. I will do on the weekend!<3
 (I will also make a good readme then)
