@@ -342,7 +342,7 @@ def process_gcode(
 
                 # compute per‑segment extrusion and modulation
                 extrusion_per_seg = e_total / (len(segments) - 1)
-                scaling = calculate_scaling_factor(
+                scaling_factor = calculate_scaling_factor(
                     current_z, last_bottom_layer, next_top_layer, max_step_size
                 )
                 # pick your amp/freq/direction based on region…
