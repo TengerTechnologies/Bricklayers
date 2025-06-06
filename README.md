@@ -81,11 +81,17 @@ Parameters:
 
 -alternate-loops -> activate the alternating sinewaves of walls for interlocking effect
 
+-perimeter-function + one of sine, triangular, trapezoidal, sawtooth -> to select a peridoic function (default: sine)
+
+-infill-function + one of sine, triangular, trapezoidal, sawtooth -> to select a peridoic function (default: sine)
+
+-resolution + number -> set the segmenting resolution in mm. (How many times your G1 movement gets segmented to apply deformation)
+
 Sample usage:
 
-```"C:\Path\To\Python\python.exe" "C:\Path\To\Script\InterlockingWalls.py" -include-infill -infill-amplitude 0.3 -include-external-perimeter -infill-frequency 2 -include-perimeters -infill-direction y -wall-direction xy -max-step-size 0.1 -wall-amplitude 0.4 -wall-frequency 2;```
+```"C:\Path\To\Python\python.exe" "C:\Path\To\Script\InterlockingWalls.py" -include-infill -infill-amplitude 0.3 -include-external-perimeter -infill-frequency 2 -include-perimeters -infill-direction y -wall-direction xy -max-step-size 0.1 -wall-amplitude 0.4 -wall-frequency 2 -infill-function sawtooth -perimeter-function triangle -resolution 0.3;```
 
-More info in this video:
+More info in these video:
 
 [![IMAGE ALT TEXT HERE](https://img.youtube.com/vi/r9YdJhN6jWQ/0.jpg)](https://www.youtube.com/watch?v=r9YdJhN6jWQ)
-
+[![IMAGE ALT TEXT HERE](https://img.youtube.com/vi/r9YdJhN6jWQ/0.jpg)](https://www.youtube.com/watch?v=WirZadHmQ3A)
