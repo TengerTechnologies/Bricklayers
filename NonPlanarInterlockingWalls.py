@@ -19,6 +19,62 @@ import logging
 import argparse
 from collections import Counter
 
+def sine_wave(x):
+    return math.sin(x)
+
+def triangle_wave(x):
+    # Create a sharp triangle wave
+     # Normalized position t in [0,1) inside each 2π period:
+    t = (x / (2 * math.pi)) % 1.0
+
+    if t < 0.5:
+        # first half of the 2π: ramp from −1 to +1
+        #   at t=0    → −1
+        #   at t=0.5  → +1
+        return -1.0 + (4.0 * t)
+    else:
+        # second half of the 2π: ramp from +1 back down to −1
+        #   at t=0.5  → +1
+        #   at t=1.0  → −1
+        return 3.0 - (4.0 * t)
+
+def trapezoidal_wave(x):
+ 
+    # t in [0,1) is the fractional position within each 2π:
+    t = (x / (2 * math.pi)) % 1.0
+
+    if t < 0.25:
+        # Ramp from −1 up to +1 over the first quarter‐period
+        #   at t=0    ⇒ −1
+        #   at t=0.25 ⇒ +1
+        return -1.0 + (t / 0.25) * 2.0
+
+    elif t < 0.50:
+        # Hold at +1 for the next quarter‐period
+        return +1.0
+
+    elif t < 0.75:
+        # Ramp from +1 down to −1 over the third quarter‐period
+        #   at t=0.50 ⇒ +1
+        #   at t=0.75 ⇒ −1
+        return +1.0 - ((t - 0.50) / 0.25) * 2.0
+
+    else:
+        # Hold at −1 for the final quarter‐period
+        return -1.0
+
+def sawtooth_wave(x):
+   
+    return 1.0 - ( (x % (2 * math.pi)) / math.pi )
+
+# Dictionary mapping function names to their implementations
+PERIODIC_FUNCTIONS = {
+    "sine": sine_wave,
+    "triangle": triangle_wave,
+    "trapezoidal": trapezoidal_wave,
+    "sawtooth": sawtooth_wave
+}
+
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -31,7 +87,7 @@ logging.basicConfig(
 DEFAULT_AMPLITUDE = 0.3
 DEFAULT_FREQUENCY = 1.1
 DEFAULT_MAX_STEP = 0.1  # Default 10% step size per layer
-SEGMENT_LENGTH = 1.0
+DEFAULT_RESOLUTION = 0.2  # Default segment length in mm
 
 # Lookup tables for different slicers
 SLICER_TYPES = {
@@ -99,7 +155,9 @@ def process_gcode(
     wall_amplitude, wall_frequency, wall_direction,
     infill_amplitude, infill_frequency, infill_direction,
     include_infill, include_perimeters, include_external_perimeters,
-    max_step_size,alternate_loops
+    max_step_size, alternate_loops,
+    infill_function="sine", perimeter_function="sine",
+    resolution=DEFAULT_RESOLUTION
 ):
     modified_lines = []
     current_z = 0
@@ -238,7 +296,7 @@ def process_gcode(
 
         # Process modulated moves that have an extrusion value.
         if current_region in ['infill', 'internal_wall', 'external_wall'] and line.startswith('G1') and 'E' in line:
-            # For walls, if we’re at the very start of a new wall region,
+            # For walls, if we're at the very start of a new wall region,
             # check if bridging is needed.
             if current_region in ['internal_wall', 'external_wall'] and in_new_wall_region:
                 in_new_wall_region = False
@@ -251,7 +309,7 @@ def process_gcode(
                     if last_nozzle_position is not None and (last_nozzle_position != (wall_x, wall_y)):
                         x1, y1 = last_nozzle_position
                         x2, y2 = wall_x, wall_y
-                        segments = segment_line(x1, y1, x2, y2, SEGMENT_LENGTH)
+                        segments = segment_line(x1, y1, x2, y2, resolution)
                         prev_pt = None
                         for i, (sx, sy) in enumerate(segments):
                             extrusion_per_segment = e_val / len(segments)
@@ -278,17 +336,18 @@ def process_gcode(
                                 angle += phase_offset
                             
                             # finally modulate Z
-                            z_mod = current_z + wall_amplitude * scaling_factor * math.sin(angle)
+                            wave_func = PERIODIC_FUNCTIONS[perimeter_function]
+                            z_mod = current_z + wall_amplitude * scaling_factor * wave_func(angle)
                             if prev_pt is not None:
                                 px, py, pz = prev_pt
                                 dz         = z_mod - pz
                                 # true 3D step length
-                                seg3d      = math.hypot(SEGMENT_LENGTH, dz)
+                                seg3d      = math.hypot(resolution, dz)
                                 # scale your original E
-                                e_adj      = extrusion_per_segment * (seg3d / SEGMENT_LENGTH)
+                                e_adj      = extrusion_per_segment * (seg3d / resolution)
                                 # emit the move at the *previous* point
                                 mod_line = f"G1 X{sx:.3f} Y{sy:.3f} Z{z_mod:.3f} E{e_adj:.5f} ;Bridge\n"
-                            else: mod_line = f"G1 X{sx:.3f} Y{sy:.3f} Z{z_mod:.3f} E{extrusion_per_segment:.5f} ;Bridge no previous point\n"# stash current as “previous” for next iteration
+                            else: mod_line = f"G1 X{sx:.3f} Y{sy:.3f} Z{z_mod:.3f} E{extrusion_per_segment:.5f} ;Bridge no previous point\n"# stash current as "previous" for next iteration
                         
                             prev_pt = (sx, sy, z_mod)
                             
@@ -331,12 +390,12 @@ def process_gcode(
 
             # 3) segment from true start→end
             x1, y1 = last_nozzle_position
-            segments = segment_line(x1, y1, x2, y2, SEGMENT_LENGTH)
+            segments = segment_line(x1, y1, x2, y2, resolution)
             prev_pt = None
 
             for i, (sx, sy) in enumerate(segments):
                 if i == 0:
-                    # seed prev_pt but don’t emit
+                    # seed prev_pt but don't emit
                     prev_pt = (sx, sy, current_z)
                     continue
 
@@ -348,8 +407,10 @@ def process_gcode(
                 # pick your amp/freq/direction based on region…
                 if current_region == 'infill':
                     amp, freq, dirn = infill_amplitude, infill_frequency, infill_direction
+                    wave_func = PERIODIC_FUNCTIONS[infill_function]
                 else:
                     amp, freq, dirn = wall_amplitude, wall_frequency, wall_direction
+                    wave_func = PERIODIC_FUNCTIONS[perimeter_function]
 
                 if dirn == "x":
                     sine_input = sx
@@ -371,11 +432,11 @@ def process_gcode(
                 if alternate_loops and current_region in ('internal_wall', 'external_wall'):
                     angle += phase_offset
                 
-                # finally modulate Z
-                z_mod = current_z + amp * scaling_factor * math.sin(angle)
+                # finally modulate Z using the selected wave function
+                z_mod = current_z + amp * scaling_factor * wave_func(angle)
                 dz    = z_mod - prev_pt[2]
-                seg3d = math.hypot(SEGMENT_LENGTH, dz)
-                e_adj = extrusion_per_seg * (seg3d / SEGMENT_LENGTH)
+                seg3d = math.hypot(resolution, dz)
+                e_adj = extrusion_per_seg * (seg3d / resolution)
 
                 # 4) emit the slice, annotated so you can verify
                 mod_line = (
@@ -430,9 +491,15 @@ if __name__ == "__main__":
     parser.add_argument("-wall-direction", choices=["x", "y", "xy", "negx", "negy", "negxy"],
                         default="x", help="Direction of sine wave for walls (default: x)")
     parser.add_argument("-max-step-size", type=float, default=DEFAULT_MAX_STEP,
-                        help="Max amplitude increase per layer as a percentage (0.0-1.0, default: 0.1)"),
+                        help="Max amplitude increase per layer as a percentage (0.0-1.0, default: 0.1)")
     parser.add_argument("-alternate-loops",action="store_true",
                         help="Alternate sine phase (low→low, high→high) on successive wall loops")
+    parser.add_argument("-infill-function", choices=["sine", "triangle", "trapezoidal", "sawtooth"],
+                        default="sine", help="Periodic function to use for infill modulation (default: sine)")
+    parser.add_argument("-perimeter-function", choices=["sine", "triangle", "trapezoidal", "sawtooth"],
+                        default="sine", help="Periodic function to use for perimeter modulation (default: sine)")
+    parser.add_argument("-resolution", type=float, default=DEFAULT_RESOLUTION,
+                        help="Resolution of wave segments in mm (default: 0.2)")
 
     args = parser.parse_args()
 
@@ -441,7 +508,10 @@ if __name__ == "__main__":
         args.wall_amplitude, args.wall_frequency, args.wall_direction,
         args.infill_amplitude, args.infill_frequency, args.infill_direction,
         args.include_infill, args.include_perimeters, args.include_external_perimeters,
-        args.max_step_size,alternate_loops=args.alternate_loops
+        args.max_step_size, alternate_loops=args.alternate_loops,
+        infill_function=args.infill_function,
+        perimeter_function=args.perimeter_function,
+        resolution=args.resolution
     )
 
     save_gcode(args.input_file, modified_lines)
