@@ -128,16 +128,39 @@ def process_gcode(input_file, layer_height, extrusion_multiplier):
     logging.info("G-code processing completed")
     logging.info(f"Log file saved at {log_file_path}")
 
+def get_layer_height_from_file(input_file):
+    try:
+        with open(input_file, 'r') as file:
+            for line in file:
+                if line.startswith("; layer_height ="):
+                    # Extract the layer height from the line
+                    return float(line.split("=")[1].strip())
+    except Exception as e:
+        print(f"Error reading layer height from file: {e}")
+    return None  # Return None if not found or an error occurs
+
 # Main execution
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Post-process G-code for Z-shifting and extrusion adjustments.")
     parser.add_argument("input_file", help="Path to the input G-code file")
-    parser.add_argument("-layerHeight", type=float, default=0.2, help="Layer height in mm (default: 0.2mm)")
+    parser.add_argument("-layerHeight", type=float, default=None, help="Layer height in mm (default: 0.2mm)")
     parser.add_argument("-extrusionMultiplier", type=float, default=1, help="Extrusion multiplier for first layer (default: 1.5x)")
     args = parser.parse_args()
-
+    
+    # Check if layerHeight is missing or None, then determine it from the file
+    layer_height = args.layerHeight
+    logging.info(f"layer height from args is {layer_height}")
+    if layer_height is None:
+        layer_height = get_layer_height_from_file(args.input_file)
+        if layer_height is None:
+            # If still None, fall back to a default
+            layer_height = 0.2
+            logging.info(f"Layer height not provided and not found in file. Defaulting to {layer_height} mm")
+        else:
+            logging.info(f"Layer height determined from file: {layer_height} mm.")
+ 
     process_gcode(
         input_file=args.input_file,
-        layer_height=args.layerHeight,
+        layer_height=layer_height,
         extrusion_multiplier=args.extrusionMultiplier,
     )
