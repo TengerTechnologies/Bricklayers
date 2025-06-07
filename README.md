@@ -13,7 +13,7 @@ This will run it with a default layerheight of 0.2.
 
 There are two parameters you can add. -layerHeight and -extrusionMultiplier
 
-The layerheight has to match the settings in the slicer to work as intended,
+The layerHeight has to match the settings in the slicer to work as intended,
 The extrusionmultiplier multiplies the extrusions of the shifted layers so you can use it to probably increase strenght(has yet to be tested).
 
 Sample: 
