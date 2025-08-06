@@ -17,6 +17,7 @@ import math
 import sys
 import logging
 import argparse
+import os
 from collections import Counter
 
 def sine_wave(x):
@@ -75,13 +76,16 @@ PERIODIC_FUNCTIONS = {
     "sawtooth": sawtooth_wave
 }
 
+# Get the directory where the script is located
+script_dir = os.path.dirname(os.path.abspath(__file__))
+
+# Configure logging to save in the script's directory
+log_file_path = os.path.join(script_dir, "NPIW_gcode_debug.log")
 logging.basicConfig(
+    filename=log_file_path,
+    filemode="w",
     level=logging.DEBUG,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler("gcode_debug.log"),
-        logging.StreamHandler(sys.stdout)
-    ]
+    format="%(asctime)s - %(message)s"
 )
 
 DEFAULT_AMPLITUDE = 0.3
